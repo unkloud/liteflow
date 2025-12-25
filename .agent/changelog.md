@@ -4,3 +4,4 @@
   improved task state management. (Contribution by Junie, an AI coding agent)
 - Refined `AGENTS.md` for clarity, fixed typos, and added specific constraints for SQLite security and absolute path requirements. (Contribution by Gemini Code Assist)
 - Added a disclaimer to README.md regarding AI generation and project status. (Contribution by Gemini Code Assist)
+- Added `simple_dag_run.py` as a basic ETL example demonstrating task dependencies and XCom. (Contribution by Gemini Code Assist)

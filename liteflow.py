@@ -6,6 +6,7 @@ import logging
 import os
 import pickle
 import sqlite3
+import sys
 import time
 import traceback
 import uuid
@@ -59,15 +60,17 @@ def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
 
 
 class LiteFlowDB:
-    def __init__(self, db_path: str = "liteflow.db"):
+    def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
-        conn.execute("PRAGMA foreign_keys = ON;")
-        conn.execute("PRAGMA journal_mode = WAL;")
+        if sys.version_info >= (3, 12):
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+            conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_FKEY, True)
         return conn
 
     def _init_schema(self):
@@ -220,7 +223,7 @@ class LiteFlowDB:
 class Task:
     task_id: str
     func: Callable
-    dag: "DAG"
+    dag: "Dag"
     dependencies: Set[str] = field(default_factory=set)
     timeout: int = 3600
 
@@ -236,8 +239,8 @@ class Task:
         return f"<Task {self.task_id}>"
 
 
-class DAG:
-    _context: Optional["DAG"] = None
+class Dag:
+    _context: Optional["Dag"] = None
 
     def __init__(
         self, dag_id: str, description: str = "", db_path: str = "liteflow.db"
@@ -249,11 +252,11 @@ class DAG:
         self.db = LiteFlowDB(db_path)
 
     def __enter__(self):
-        DAG._context = self
+        Dag._context = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        DAG._context = None
+        Dag._context = None
         self.register()
 
     def register(self):
@@ -423,11 +426,11 @@ def task(task_id: str = None, timeout: int = 3600):
         if task_id is None:
             task_id = func.__name__
 
-        if DAG._context is None:
+        if Dag._context is None:
             raise RuntimeError("Tasks must be defined within a DAG context")
 
-        t = Task(task_id=task_id, func=func, dag=DAG._context, timeout=timeout)
-        DAG._context.add_task(t)
+        t = Task(task_id=task_id, func=func, dag=Dag._context, timeout=timeout)
+        Dag._context.add_task(t)
 
         @wraps(func)
         def wrapper(*args, **kwargs):

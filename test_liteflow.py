@@ -5,7 +5,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import DAG, task, LiteFlowDB
+from liteflow import Dag, task, LiteFlowDB
 
 
 # Helper functions for tests (must be top-level for pickling)
@@ -88,7 +88,7 @@ class TestLiteFlow(unittest.TestCase):
             shutil.rmtree(self.xcom_dir)
 
     def test_dag_registration(self):
-        with DAG("test_dag", description="A test DAG", db_path=self.db_path) as dag:
+        with Dag("test_dag", description="A test DAG", db_path=self.db_path) as dag:
 
             @task(task_id="t1")
             def t1():
@@ -96,7 +96,9 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT dag_id, description FROM liteflow_dags WHERE dag_id='test_dag'")
+        cursor.execute(
+            "SELECT dag_id, description FROM liteflow_dags WHERE dag_id='test_dag'"
+        )
         row = cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "test_dag")
@@ -104,7 +106,7 @@ class TestLiteFlow(unittest.TestCase):
         conn.close()
 
     def test_dag_execution_success(self):
-        with DAG("success_dag", db_path=self.db_path) as dag:
+        with Dag("success_dag", db_path=self.db_path) as dag:
             t1 = task(task_id="t1")(t1_success)
             t2 = task(task_id="t2")(t2_success)
             t1 >> t2
@@ -113,7 +115,9 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE dag_id='success_dag'")
+        cursor.execute(
+            "SELECT status FROM liteflow_dag_runs WHERE dag_id='success_dag'"
+        )
         status = cursor.fetchone()[0]
         self.assertEqual(status, "SUCCESS")
 
@@ -127,7 +131,7 @@ class TestLiteFlow(unittest.TestCase):
         conn.close()
 
     def test_dag_execution_failure(self):
-        with DAG("fail_dag", db_path=self.db_path) as dag:
+        with Dag("fail_dag", db_path=self.db_path) as dag:
             t1 = task(task_id="t1")(t1_fail)
 
             @task(task_id="t2")
@@ -158,7 +162,7 @@ class TestLiteFlow(unittest.TestCase):
         with open("fail_once.flag", "w") as f:
             f.write("1")
 
-        with DAG("resume_dag", db_path=self.db_path) as dag:
+        with Dag("resume_dag", db_path=self.db_path) as dag:
             t1 = task(task_id="t1")(t1_resume)
             t2 = task(task_id="t2")(t2_resume)
             t1 >> t2
@@ -198,7 +202,7 @@ class TestLiteFlow(unittest.TestCase):
         conn.close()
 
     def test_xcom_passing(self):
-        with DAG("xcom_dag", db_path=self.db_path) as dag:
+        with Dag("xcom_dag", db_path=self.db_path) as dag:
             t1 = task(task_id="producer")(producer_func)
             t2 = task(task_id="consumer")(consumer_func)
             t1 >> t2
@@ -227,7 +231,7 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_timeout(self):
         # This test should verify that a task timing out is marked as FAILED
-        with DAG("timeout_dag", db_path=self.db_path) as dag:
+        with Dag("timeout_dag", db_path=self.db_path) as dag:
             task(task_id="slow_task", timeout=1)(slow_task_wrapper)
 
         start_time = time.time()
@@ -256,7 +260,7 @@ class TestLiteFlow(unittest.TestCase):
         # This test verifies that tasks run in different processes
         main_pid = os.getpid()
 
-        with DAG("isolation_dag", db_path=self.db_path) as dag:
+        with Dag("isolation_dag", db_path=self.db_path) as dag:
             task(task_id="t1")(get_pid_wrapper)
 
         run_id = dag.run()
@@ -266,7 +270,7 @@ class TestLiteFlow(unittest.TestCase):
         self.assertNotEqual(task_pid, main_pid)
 
     def test_large_xcom(self):
-        with DAG("large_xcom_dag", db_path=self.db_path) as dag:
+        with Dag("large_xcom_dag", db_path=self.db_path) as dag:
             t1 = task(task_id="producer")(large_producer)
             t2 = task(task_id="consumer")(large_consumer)
             t1 >> t2
