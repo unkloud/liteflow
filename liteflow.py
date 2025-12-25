@@ -150,18 +150,17 @@ def generate_uuid() -> str:
 def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
     """Wrapper to execute a task in a separate process."""
     logger.info(f"Worker executing task {task_id} (Run: {run_id})")
-    db = LiteFlowDB(db_path)
-    db.set_task_status(run_id, task_id, Status.RUNNING)
+    set_task_status(db_path, run_id, task_id, Status.RUNNING)
     try:
         result = func(**kwargs)
         store_xcom(db_path, run_id, task_id, "return_value", result)
-        db.set_task_status(run_id, task_id, Status.SUCCESS)
+        set_task_status(db_path, run_id, task_id, Status.SUCCESS)
         logger.info(f"Worker finished task {task_id} successfully")
         return None
     except Exception:
         err = traceback.format_exc()
         logger.error(f"Worker failed task {task_id}: {err}")
-        db.set_task_status(run_id, task_id, Status.FAILED, error_log=err)
+        set_task_status(db_path, run_id, task_id, Status.FAILED, error_log=err)
         return err
 
 
@@ -186,42 +185,38 @@ def init_schema(db_path: str):
             conn.executescript(SQL_INIT_SCHEMA)
 
 
-class LiteFlowDB:
-    def __init__(self, db_path: str):
-        self.db_path = db_path
-        init_schema(self.db_path)
+def get_task_states(db_path: str, run_id: str) -> Dict[str, str]:
+    """Retrieves the current status of all tasks in a run."""
+    with closing(connect(db_path)) as conn:
+        rows = conn.execute(SQL_GET_TASK_STATES, (run_id,)).fetchall()
+        return {row["task_id"]: row["status"] for row in rows}
 
-    def get_task_states(self, run_id: str) -> Dict[str, str]:
-        """Retrieves the current status of all tasks in a run."""
-        with closing(connect(self.db_path)) as conn:
-            rows = conn.execute(SQL_GET_TASK_STATES, (run_id,)).fetchall()
-            return {row["task_id"]: row["status"] for row in rows}
 
-    def set_task_status(
-        self, run_id: str, task_id: str, status: str, error_log: str = None
-    ):
-        """Updates the status and timestamp of a specific task."""
-        logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
-        with closing(connect(self.db_path)) as conn:
-            with conn:
-                if error_log:
-                    conn.execute(
-                        SQL_UPDATE_TASK_STATUS_ERROR,
-                        (status, int(time.time()), error_log, run_id, task_id),
-                    )
-                else:
-                    conn.execute(
-                        SQL_UPDATE_TASK_STATUS,
-                        (status, int(time.time()), run_id, task_id),
-                    )
+def set_task_status(
+    db_path: str, run_id: str, task_id: str, status: str, error_log: str = None
+):
+    """Updates the status and timestamp of a specific task."""
+    logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
+    with closing(connect(db_path)) as conn:
+        with conn:
+            if error_log:
+                conn.execute(
+                    SQL_UPDATE_TASK_STATUS_ERROR,
+                    (status, int(time.time()), error_log, run_id, task_id),
+                )
+            else:
+                conn.execute(
+                    SQL_UPDATE_TASK_STATUS,
+                    (status, int(time.time()), run_id, task_id),
+                )
 
-    def update_run_status(self, run_id: str, status: str):
-        """Updates the overall status of a DAG run."""
-        logger.info(f"Updating run {run_id} status to {status}")
-        with closing(connect(self.db_path)) as conn:
-            with conn:
-                conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
 
+def update_run_status(db_path: str, run_id: str, status: str):
+    """Updates the overall status of a DAG run."""
+    logger.info(f"Updating run {run_id} status to {status}")
+    with closing(connect(db_path)) as conn:
+        with conn:
+            conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
 
 def store_xcom(db_path: str, run_id: str, task_id: str, key: str, value: Any):
     """Stores an XCom value, spilling to disk if too large."""
@@ -294,7 +289,7 @@ class Dag:
         self.description = description
         self.tasks: Dict[str, Task] = {}
         self.db_path = db_path
-        self.db = LiteFlowDB(db_path)
+        init_schema(self.db_path)
 
     def __enter__(self):
         Dag._context = self
@@ -380,14 +375,14 @@ class Dag:
             ts.prepare()
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
-            self.db.update_run_status(run_id, Status.FAILED)
+            update_run_status(self.db_path, run_id, Status.FAILED)
             return run_id
 
         # Get current state of tasks
-        task_states = self.db.get_task_states(run_id)
+        task_states = get_task_states(self.db_path, run_id)
 
         # Mark run as RUNNING
-        self.db.update_run_status(run_id, Status.RUNNING)
+        update_run_status(self.db_path, run_id, Status.RUNNING)
 
         futures = {}
         start_times = {}
@@ -437,12 +432,12 @@ class Dag:
                     try:
                         error = future.result()
                         if error:
-                            self.db.update_run_status(run_id, Status.FAILED)
+                            update_run_status(self.db_path, run_id, Status.FAILED)
                             return run_id
                         ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
-                        self.db.update_run_status(run_id, Status.FAILED)
+                        update_run_status(self.db_path, run_id, Status.FAILED)
                         return run_id
 
                 # Check for timeouts
@@ -452,17 +447,17 @@ class Dag:
                         logger.error(
                             f"Task {task_id} timed out after {self.tasks[task_id].timeout}s"
                         )
-                        self.db.set_task_status(
-                            run_id, task_id, Status.FAILED, error_log="TimeoutError"
+                        set_task_status(
+                            self.db_path, run_id, task_id, Status.FAILED, error_log="TimeoutError"
                         )
-                        self.db.update_run_status(run_id, Status.FAILED)
+                        update_run_status(self.db_path, run_id, Status.FAILED)
                         # We can't easily kill the task in ProcessPoolExecutor,
                         # but we can stop the DAG.
                         return run_id
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        self.db.update_run_status(run_id, Status.SUCCESS)
+        update_run_status(self.db_path, run_id, Status.SUCCESS)
         logger.info(f"DAG run {run_id} completed successfully.")
         return run_id
 

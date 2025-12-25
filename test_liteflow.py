@@ -6,7 +6,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import Dag, task, LiteFlowDB, get_xcom
+from liteflow import Dag, task, get_xcom, get_task_states, init_schema
 
 
 # Helper functions for tests (must be top-level for pickling)
@@ -86,7 +86,7 @@ class TestLiteFlow(unittest.TestCase):
             os.remove("fail_once.flag")
         if os.path.exists(self.xcom_dir):
             shutil.rmtree(self.xcom_dir)
-        self.db = LiteFlowDB(self.db_path)
+        init_schema(self.db_path)
 
     def tearDown(self):
         if os.path.exists(self.db_path):
@@ -251,7 +251,7 @@ class TestLiteFlow(unittest.TestCase):
         self.assertLess(end_time - start_time, 4)
 
         # Check status in DB
-        states = self.db.get_task_states(run_id)
+        states = get_task_states(self.db_path, run_id)
         self.assertEqual(states["slow_task"], "FAILED")
 
         # Check error log
@@ -323,7 +323,7 @@ class TestLiteFlow(unittest.TestCase):
 
         run_id = dag.run()
 
-        states = self.db.get_task_states(run_id)
+        states = get_task_states(self.db_path, run_id)
         for tid in ["A", "B", "C", "D"]:
             self.assertEqual(states[tid], "SUCCESS")
 
