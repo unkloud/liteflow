@@ -249,14 +249,14 @@ class TestLiteFlow(unittest.TestCase):
             task(task_id="slow_task", timeout=1)(slow_task_wrapper)
 
         start_time = time.time()
-        run_id = dag.run().run_id
+        dag_run = dag.run()
         end_time = time.time()
 
         # It should have failed around 1 second, not 5
         self.assertLess(end_time - start_time, 4)
 
         # Check status in DB
-        states = TaskInstance.get_all_states(self.db_path, run_id)
+        states = dag_run.get_all_task_states(self.db_path)
         self.assertEqual(states["slow_task"], "FAILED")
 
         # Check error log
@@ -264,7 +264,7 @@ class TestLiteFlow(unittest.TestCase):
         cursor = conn.cursor()
         cursor.execute(
             "SELECT error_log FROM liteflow_task_instances WHERE run_id=? AND task_id='slow_task'",
-            (run_id,),
+            (dag_run.run_id,),
         )
         log = cursor.fetchone()[0]
         self.assertEqual(log, "TimeoutError")
@@ -326,9 +326,9 @@ class TestLiteFlow(unittest.TestCase):
             tb >> td
             tc >> td
 
-        run_id = dag.run().run_id
+        dag_run = dag.run()
 
-        states = TaskInstance.get_all_states(self.db_path, run_id)
+        states = dag_run.get_all_task_states(self.db_path)
         for tid in ["A", "B", "C", "D"]:
             self.assertEqual(states[tid], "SUCCESS")
 

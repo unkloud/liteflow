@@ -77,16 +77,25 @@ class DagRun:
                 )
         return cls(run_id=run_id, dag_id=dag_id, status=Status.PENDING, created_at=now)
 
-    @classmethod
-    def update_status(cls, db_path: str, run_id: str, status: str):
+    def update_status(self, db_path: str, status: str):
         """Updates the status of this run."""
-        logger.info(f"Updating run {run_id} status to {status}")
+        logger.info(f"Updating run {self.run_id} status to {status}")
         with closing(connect(db_path)) as conn:
             with conn:
                 conn.execute(
                     "UPDATE liteflow_dag_runs SET status = ? WHERE run_id = ?",
-                    (status, run_id),
+                    (status, self.run_id),
                 )
+        self.status = status
+
+    def get_all_task_states(self, db_path: str) -> Dict[str, str]:
+        """Retrieves status map for all tasks in this run."""
+        with closing(connect(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
+                (self.run_id,),
+            ).fetchall()
+            return {row["task_id"]: row["status"] for row in rows}
 
 
 @dataclass
@@ -162,16 +171,6 @@ class TaskInstance:
                         "UPDATE liteflow_task_instances SET status = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
                         (status, now, run_id, task_id),
                     )
-
-    @classmethod
-    def get_all_states(cls, db_path: str, run_id: str) -> Dict[str, str]:
-        """Retrieves status map for all tasks in a run."""
-        with closing(connect(db_path)) as conn:
-            rows = conn.execute(
-                "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
-                (run_id,),
-            ).fetchall()
-            return {row["task_id"]: row["status"] for row in rows}
 
     @staticmethod
     def execute_wrapper(db_path: str, run_id: str, task_id: str, func, kwargs):
@@ -396,11 +395,7 @@ class Dag:
         """Executes the DAG using ProcessPoolExecutor."""
         if dag_run is None:
             dag_run = self.create_run()
-
-        run_id = dag_run.run_id
-
-        logger.info(f"Starting DAG run {run_id} for DAG {self.dag_id}")
-
+        logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
         # Build the graph for execution
         graph = {t_id: task.dependencies for t_id, task in self.tasks.items()}
         logger.info(f"Graph for DAG {self.dag_id}: {graph}")
@@ -409,15 +404,12 @@ class Dag:
             ts.prepare()
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
-            DagRun.update_status(self.db_path, run_id, Status.FAILED)
+            dag_run.update_status(self.db_path, Status.FAILED)
             return dag_run
-
         # Get current state of tasks
-        task_states = TaskInstance.get_all_states(self.db_path, run_id)
-
+        task_states = dag_run.get_all_task_states(self.db_path)
         # Mark run as RUNNING
-        DagRun.update_status(self.db_path, run_id, Status.RUNNING)
-
+        dag_run.update_status(self.db_path, Status.RUNNING)
         futures = {}
         start_times = {}
         executor = concurrent.futures.ProcessPoolExecutor()
@@ -431,49 +423,42 @@ class Dag:
                         logger.info(f"Task {task_id} already SUCCESS, skipping.")
                         ts.done(task_id)
                         continue
-
                     # Execute task
                     logger.info(f"Scheduling task {task_id}")
                     task = self.tasks[task_id]
-
-                    kwargs = self._resolve_task_kwargs(task, run_id)
-
+                    kwargs = self._resolve_task_kwargs(task, dag_run.run_id)
                     start_times[task_id] = time.time()
                     future = executor.submit(
                         TaskInstance.execute_wrapper,
                         self.db_path,
-                        run_id,
+                        dag_run.run_id,
                         task_id,
                         task.func,
                         kwargs,
                     )
                     futures[future] = task_id
-
                 if not futures:
                     if ts.is_active():
                         continue
                     break
-
                 # Wait for at least one task to finish, or a timeout to occur
                 # We use a short 1s timeout to check for our own task timeouts
                 done, _ = concurrent.futures.wait(
                     futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED
                 )
-
                 for future in done:
                     task_id = futures.pop(future)
                     start_times.pop(task_id, None)
                     try:
                         error = future.result()
                         if error:
-                            DagRun.update_status(self.db_path, run_id, Status.FAILED)
+                            dag_run.update_status(self.db_path, Status.FAILED)
                             return dag_run
                         ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
-                        DagRun.update_status(self.db_path, run_id, Status.FAILED)
+                        dag_run.update_status(self.db_path, Status.FAILED)
                         return dag_run
-
                 # Check for timeouts
                 now = time.time()
                 for future, task_id in list(futures.items()):
@@ -483,20 +468,19 @@ class Dag:
                         )
                         TaskInstance.update_status(
                             self.db_path,
-                            run_id,
+                            dag_run.run_id,
                             task_id,
                             Status.FAILED,
                             error_log="TimeoutError",
                         )
-                        DagRun.update_status(self.db_path, run_id, Status.FAILED)
+                        dag_run.update_status(self.db_path, Status.FAILED)
                         # We can't easily kill the task in ProcessPoolExecutor,
                         # but we can stop the DAG.
                         return dag_run
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
-
-        DagRun.update_status(self.db_path, run_id, Status.SUCCESS)
-        logger.info(f"DAG run {run_id} completed successfully.")
+        dag_run.update_status(self.db_path, Status.SUCCESS)
+        logger.info(f"DAG run {dag_run.run_id} completed successfully.")
         return dag_run
 
 
@@ -507,13 +491,10 @@ def task(task_id: str = None, timeout: int = 3600):
         nonlocal task_id
         if task_id is None:
             task_id = func.__name__
-
         if Dag._context is None:
             raise RuntimeError("Tasks must be defined within a DAG context")
-
         t = Task(task_id=task_id, func=func, dag=Dag._context, timeout=timeout)
         Dag._context.add_task(t)
-
         return t
 
     return decorator
