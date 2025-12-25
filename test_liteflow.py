@@ -91,6 +91,10 @@ class TestLiteFlow(unittest.TestCase):
     def tearDown(self):
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
+        if os.path.exists(f"{self.db_path}-wal"):
+            os.remove(f"{self.db_path}-wal")
+        if os.path.exists(f"{self.db_path}-shm"):
+            os.remove(f"{self.db_path}-shm")
         if os.path.exists("fail_once.flag"):
             os.remove("fail_once.flag")
         if os.path.exists(self.xcom_dir):
@@ -393,7 +397,7 @@ class TestLiteFlow(unittest.TestCase):
         self.assertEqual(cursor.fetchone()[0], "SUCCESS")
 
         cursor.execute(
-            "SELECT count(*) FROM liteflow_task_instances WHERE run_id=? AND status='SUCCESS'",
+            "SELECT COUNT(*) FROM liteflow_task_instances WHERE run_id=? AND status='SUCCESS'",
             (run_id,),
         )
         self.assertEqual(cursor.fetchone()[0], 2000)
