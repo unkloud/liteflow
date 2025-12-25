@@ -392,10 +392,9 @@ class Dag:
                 kwargs[param_name] = val
         return kwargs
 
-    def run(self, dag_run: DagRun = None):
+    def run(self) -> DagRun:
         """Executes the DAG using ProcessPoolExecutor."""
-        if dag_run is None:
-            dag_run = self.create_run()
+        dag_run = self.create_run()
         logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
         # Build the graph for execution
         graph = {t_id: task.dependencies for t_id, task in self.tasks.items()}
