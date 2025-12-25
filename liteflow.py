@@ -33,76 +33,75 @@ logger = logging.getLogger("LiteFlow")
 
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
-
 # --- SQL Statements ---
 SQL_INIT_SCHEMA = """
-    -- 1. Registered DAG definitions (prefixed)
-    CREATE TABLE IF NOT EXISTS liteflow_dags
-    (
-        dag_id      TEXT PRIMARY KEY,
-        description TEXT,
-        is_active   INTEGER DEFAULT 1,
-        created_at  INTEGER NOT NULL
-    ) STRICT;
+                  -- 1. Registered DAG definitions (prefixed)
+                  CREATE TABLE IF NOT EXISTS liteflow_dags
+                  (
+                      dag_id      TEXT PRIMARY KEY,
+                      description TEXT,
+                      is_active   INTEGER DEFAULT 1,
+                      created_at  INTEGER NOT NULL
+                  ) STRICT;
 
-    -- 2. DAG execution instances (prefixed)
-    CREATE TABLE IF NOT EXISTS liteflow_dag_runs
-    (
-        run_id     TEXT PRIMARY KEY,
-        dag_id     TEXT    NOT NULL,
-        status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-        created_at INTEGER NOT NULL,
-        FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
-    ) STRICT;
+                  -- 2. DAG execution instances (prefixed)
+                  CREATE TABLE IF NOT EXISTS liteflow_dag_runs
+                  (
+                      run_id     TEXT PRIMARY KEY,
+                      dag_id     TEXT    NOT NULL,
+                      status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+                      created_at INTEGER NOT NULL,
+                      FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
+                  ) STRICT;
 
-    -- 3. Individual task node states (prefixed)
-    CREATE TABLE IF NOT EXISTS liteflow_task_instances
-    (
-        run_id       TEXT    NOT NULL,
-        task_id      TEXT    NOT NULL,
-        status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-        dependencies TEXT,                 -- JSON array of task_id strings
-        timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
-        error_log    TEXT,                 -- Stack trace or error message
-        updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
-        PRIMARY KEY (run_id, task_id),
-        FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
-    ) STRICT;
+                  -- 3. Individual task node states (prefixed)
+                  CREATE TABLE IF NOT EXISTS liteflow_task_instances
+                  (
+                      run_id       TEXT    NOT NULL,
+                      task_id      TEXT    NOT NULL,
+                      status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+                      dependencies TEXT,                 -- JSON array of task_id strings
+                      timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
+                      error_log    TEXT,                 -- Stack trace or error message
+                      updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
+                      PRIMARY KEY (run_id, task_id),
+                      FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
+                  ) STRICT;
 
-    -- 4. Inter-task communication (XCom) (prefixed)
-    CREATE TABLE IF NOT EXISTS liteflow_xcom
-    (
-        run_id  TEXT NOT NULL,
-        task_id TEXT NOT NULL,
-        key     TEXT NOT NULL,
-        value   BLOB, -- Pickled Python object
-        PRIMARY KEY (run_id, task_id, key),
-        FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
-    ) STRICT;
+                  -- 4. Inter-task communication (XCom) (prefixed)
+                  CREATE TABLE IF NOT EXISTS liteflow_xcom
+                  (
+                      run_id  TEXT NOT NULL,
+                      task_id TEXT NOT NULL,
+                      key     TEXT NOT NULL,
+                      value   BLOB, -- Pickled Python object
+                      PRIMARY KEY (run_id, task_id, key),
+                      FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
+                  ) STRICT;
 
-    CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
-"""
+                  CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status); \
+                  """
 
 SQL_GET_TASK_STATES = (
     "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?"
 )
 
 SQL_UPDATE_TASK_STATUS_ERROR = """
-    UPDATE liteflow_task_instances
-    SET status     = ?,
-        updated_at = ?,
-        error_log  = ?
-    WHERE run_id = ?
-      AND task_id = ?
-"""
+                               UPDATE liteflow_task_instances
+                               SET status     = ?,
+                                   updated_at = ?,
+                                   error_log  = ?
+                               WHERE run_id = ?
+                                 AND task_id = ? \
+                               """
 
 SQL_UPDATE_TASK_STATUS = """
-    UPDATE liteflow_task_instances
-    SET status     = ?,
-        updated_at = ?
-    WHERE run_id = ?
-      AND task_id = ?
-"""
+                         UPDATE liteflow_task_instances
+                         SET status     = ?,
+                             updated_at = ?
+                         WHERE run_id = ?
+                           AND task_id = ? \
+                         """
 
 SQL_UPDATE_RUN_STATUS = "UPDATE liteflow_dag_runs SET status = ? WHERE run_id = ?"
 
@@ -112,12 +111,12 @@ SQL_UPSERT_XCOM = """
 """
 
 SQL_GET_XCOM = """
-    SELECT value
-    FROM liteflow_xcom
-    WHERE run_id = ?
-      AND task_id = ?
-      AND key = ?
-"""
+               SELECT value
+               FROM liteflow_xcom
+               WHERE run_id = ?
+                 AND task_id = ?
+                 AND key = ? \
+               """
 
 SQL_REGISTER_DAG = """
     INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
@@ -127,9 +126,9 @@ SQL_REGISTER_DAG = """
 SQL_INSERT_DAG_RUN = "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)"
 
 SQL_INSERT_TASK_INSTANCE = """
-    INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
-    VALUES (?, ?, ?, ?, ?, ?)
-"""
+                           INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
+                           VALUES (?, ?, ?, ?, ?, ?) \
+                           """
 
 
 class Status:
@@ -354,7 +353,9 @@ class Dag:
         kwargs = {}
         for param_name in sig.parameters:
             if param_name in task.dependencies:
-                logger.debug(f"Resolving dependency arg '{param_name}' for task {task.task_id}")
+                logger.debug(
+                    f"Resolving dependency arg '{param_name}' for task {task.task_id}"
+                )
                 val = self.db.get_xcom(run_id, param_name, "return_value")
                 kwargs[param_name] = val
         return kwargs
