@@ -152,43 +152,44 @@ class TaskInstance:
                 )
         return cls(run_id, task_id, Status.PENDING, dependencies, timeout, now)
 
-    @classmethod
-    def update_status(
-        cls, db_path: str, run_id: str, task_id: str, status: str, error_log: str = None
-    ):
-        """Updates the status of a specific task."""
-        logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
+    def update_status(self, db_path: str, status: str, error_log: str = None):
+        """Updates the status of this task instance."""
+        logger.debug(
+            f"Updating task {self.task_id} status to {status} (Run: {self.run_id})"
+        )
         now = int(time.time())
         with closing(connect(db_path)) as conn:
             with conn:
                 if error_log:
                     conn.execute(
                         "UPDATE liteflow_task_instances SET status = ?, updated_at = ?, error_log = ? WHERE run_id = ? AND task_id = ?",
-                        (status, now, error_log, run_id, task_id),
+                        (status, now, error_log, self.run_id, self.task_id),
                     )
                 else:
                     conn.execute(
                         "UPDATE liteflow_task_instances SET status = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
-                        (status, now, run_id, task_id),
+                        (status, now, self.run_id, self.task_id),
                     )
+        self.status = status
+        self.updated_at = now
+        if error_log:
+            self.error_log = error_log
 
     @staticmethod
-    def execute_wrapper(db_path: str, run_id: str, task_id: str, func, kwargs):
+    def execute_wrapper(db_path: str, ti: "TaskInstance", func, kwargs):
         """Wrapper to execute a task in a separate process."""
-        logger.info(f"Worker executing task {task_id} (Run: {run_id})")
-        TaskInstance.update_status(db_path, run_id, task_id, Status.RUNNING)
+        logger.info(f"Worker executing task {ti.task_id} (Run: {ti.run_id})")
+        ti.update_status(db_path, Status.RUNNING)
         try:
             result = func(**kwargs)
-            XCom.save(db_path, run_id, task_id, "return_value", result)
-            TaskInstance.update_status(db_path, run_id, task_id, Status.SUCCESS)
-            logger.info(f"Worker finished task {task_id} successfully")
+            XCom.save(db_path, ti.run_id, ti.task_id, "return_value", result)
+            ti.update_status(db_path, Status.SUCCESS)
+            logger.info(f"Worker finished task {ti.task_id} successfully")
             return None
         except Exception:
             err = traceback.format_exc()
-            logger.error(f"Worker failed task {task_id}: {err}")
-            TaskInstance.update_status(
-                db_path, run_id, task_id, Status.FAILED, error_log=err
-            )
+            logger.error(f"Worker failed task {ti.task_id}: {err}")
+            ti.update_status(db_path, Status.FAILED, error_log=err)
             return err
 
 
@@ -428,11 +429,18 @@ class Dag:
                     task = self.tasks[task_id]
                     kwargs = self._resolve_task_kwargs(task, dag_run.run_id)
                     start_times[task_id] = time.time()
+                    ti = TaskInstance(
+                        run_id=dag_run.run_id,
+                        task_id=task_id,
+                        status=Status.PENDING,
+                        dependencies=list(task.dependencies),
+                        timeout=task.timeout,
+                        updated_at=int(time.time()),
+                    )
                     future = executor.submit(
                         TaskInstance.execute_wrapper,
                         self.db_path,
-                        dag_run.run_id,
-                        task_id,
+                        ti,
                         task.func,
                         kwargs,
                     )
@@ -466,10 +474,16 @@ class Dag:
                         logger.error(
                             f"Task {task_id} timed out after {self.tasks[task_id].timeout}s"
                         )
-                        TaskInstance.update_status(
+                        ti = TaskInstance(
+                            run_id=dag_run.run_id,
+                            task_id=task_id,
+                            status=Status.RUNNING,
+                            dependencies=list(self.tasks[task_id].dependencies),
+                            timeout=self.tasks[task_id].timeout,
+                            updated_at=int(now),
+                        )
+                        ti.update_status(
                             self.db_path,
-                            dag_run.run_id,
-                            task_id,
                             Status.FAILED,
                             error_log="TimeoutError",
                         )
