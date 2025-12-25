@@ -34,6 +34,103 @@ logger = logging.getLogger("LiteFlow")
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
+# --- SQL Statements ---
+SQL_INIT_SCHEMA = """
+    -- 1. Registered DAG definitions (prefixed)
+    CREATE TABLE IF NOT EXISTS liteflow_dags
+    (
+        dag_id      TEXT PRIMARY KEY,
+        description TEXT,
+        is_active   INTEGER DEFAULT 1,
+        created_at  INTEGER NOT NULL
+    ) STRICT;
+
+    -- 2. DAG execution instances (prefixed)
+    CREATE TABLE IF NOT EXISTS liteflow_dag_runs
+    (
+        run_id     TEXT PRIMARY KEY,
+        dag_id     TEXT    NOT NULL,
+        status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+        created_at INTEGER NOT NULL,
+        FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
+    ) STRICT;
+
+    -- 3. Individual task node states (prefixed)
+    CREATE TABLE IF NOT EXISTS liteflow_task_instances
+    (
+        run_id       TEXT    NOT NULL,
+        task_id      TEXT    NOT NULL,
+        status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+        dependencies TEXT,                 -- JSON array of task_id strings
+        timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
+        error_log    TEXT,                 -- Stack trace or error message
+        updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
+        PRIMARY KEY (run_id, task_id),
+        FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
+    ) STRICT;
+
+    -- 4. Inter-task communication (XCom) (prefixed)
+    CREATE TABLE IF NOT EXISTS liteflow_xcom
+    (
+        run_id  TEXT NOT NULL,
+        task_id TEXT NOT NULL,
+        key     TEXT NOT NULL,
+        value   BLOB, -- Pickled Python object
+        PRIMARY KEY (run_id, task_id, key),
+        FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
+    ) STRICT;
+
+    CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
+"""
+
+SQL_GET_TASK_STATES = (
+    "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?"
+)
+
+SQL_UPDATE_TASK_STATUS_ERROR = """
+    UPDATE liteflow_task_instances
+    SET status     = ?,
+        updated_at = ?,
+        error_log  = ?
+    WHERE run_id = ?
+      AND task_id = ?
+"""
+
+SQL_UPDATE_TASK_STATUS = """
+    UPDATE liteflow_task_instances
+    SET status     = ?,
+        updated_at = ?
+    WHERE run_id = ?
+      AND task_id = ?
+"""
+
+SQL_UPDATE_RUN_STATUS = "UPDATE liteflow_dag_runs SET status = ? WHERE run_id = ?"
+
+SQL_UPSERT_XCOM = """
+    INSERT OR REPLACE INTO liteflow_xcom (run_id, task_id, key, value)
+    VALUES (?, ?, ?, ?)
+"""
+
+SQL_GET_XCOM = """
+    SELECT value
+    FROM liteflow_xcom
+    WHERE run_id = ?
+      AND task_id = ?
+      AND key = ?
+"""
+
+SQL_REGISTER_DAG = """
+    INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
+    VALUES (?, ?, ?)
+"""
+
+SQL_INSERT_DAG_RUN = "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)"
+
+SQL_INSERT_TASK_INSTANCE = """
+    INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
+    VALUES (?, ?, ?, ?, ?, ?)
+"""
+
 
 class Status:
     PENDING = "PENDING"
@@ -86,63 +183,12 @@ class LiteFlowDB:
         """Initializes the database schema with necessary tables."""
         with closing(connect(self.db_path)) as conn:
             with conn:
-                conn.executescript(
-                    """
-                    -- 1. Registered DAG definitions (prefixed)
-                    CREATE TABLE IF NOT EXISTS liteflow_dags
-                    (
-                        dag_id      TEXT PRIMARY KEY,
-                        description TEXT,
-                        is_active   INTEGER DEFAULT 1,
-                        created_at  INTEGER NOT NULL
-                    ) STRICT;
-
-                    -- 2. DAG execution instances (prefixed)
-                    CREATE TABLE IF NOT EXISTS liteflow_dag_runs
-                    (
-                        run_id     TEXT PRIMARY KEY,
-                        dag_id     TEXT    NOT NULL,
-                        status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-                        created_at INTEGER NOT NULL,
-                        FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
-                    ) STRICT;
-
-                    -- 3. Individual task node states (prefixed)
-                    CREATE TABLE IF NOT EXISTS liteflow_task_instances
-                    (
-                        run_id       TEXT    NOT NULL,
-                        task_id      TEXT    NOT NULL,
-                        status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-                        dependencies TEXT,                 -- JSON array of task_id strings
-                        timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
-                        error_log    TEXT,                 -- Stack trace or error message
-                        updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
-                        PRIMARY KEY (run_id, task_id),
-                        FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
-                    ) STRICT;
-
-                    -- 4. Inter-task communication (XCom) (prefixed)
-                    CREATE TABLE IF NOT EXISTS liteflow_xcom
-                    (
-                        run_id  TEXT NOT NULL,
-                        task_id TEXT NOT NULL,
-                        key     TEXT NOT NULL,
-                        value   BLOB, -- Pickled Python object
-                        PRIMARY KEY (run_id, task_id, key),
-                        FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
-                    ) STRICT;
-
-                    CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
-                    """
-                )
+                conn.executescript(SQL_INIT_SCHEMA)
 
     def get_task_states(self, run_id: str) -> Dict[str, str]:
         """Retrieves the current status of all tasks in a run."""
         with closing(connect(self.db_path)) as conn:
-            rows = conn.execute(
-                "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
-                (run_id,),
-            ).fetchall()
+            rows = conn.execute(SQL_GET_TASK_STATES, (run_id,)).fetchall()
             return {row["task_id"]: row["status"] for row in rows}
 
     def set_task_status(
@@ -153,25 +199,12 @@ class LiteFlowDB:
             with conn:
                 if error_log:
                     conn.execute(
-                        """
-                        UPDATE liteflow_task_instances
-                        SET status     = ?,
-                            updated_at = ?,
-                            error_log  = ?
-                        WHERE run_id = ?
-                          AND task_id = ?
-                        """,
+                        SQL_UPDATE_TASK_STATUS_ERROR,
                         (status, int(time.time()), error_log, run_id, task_id),
                     )
                 else:
                     conn.execute(
-                        """
-                        UPDATE liteflow_task_instances
-                        SET status     = ?,
-                            updated_at = ?
-                        WHERE run_id = ?
-                          AND task_id = ?
-                        """,
+                        SQL_UPDATE_TASK_STATUS,
                         (status, int(time.time()), run_id, task_id),
                     )
 
@@ -179,14 +212,7 @@ class LiteFlowDB:
         """Updates the overall status of a DAG run."""
         with closing(connect(self.db_path)) as conn:
             with conn:
-                conn.execute(
-                    """
-                    UPDATE liteflow_dag_runs
-                    SET status = ?
-                    WHERE run_id = ?
-                    """,
-                    (status, run_id),
-                )
+                conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
 
     def store_xcom(self, run_id: str, task_id: str, key: str, value: Any):
         """Stores an XCom value, spilling to disk if too large."""
@@ -203,10 +229,7 @@ class LiteFlowDB:
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
-                    """
-                    INSERT OR REPLACE INTO liteflow_xcom (run_id, task_id, key, value)
-                    VALUES (?, ?, ?, ?)
-                """,
+                    SQL_UPSERT_XCOM,
                     (run_id, task_id, key, blob),
                 )
 
@@ -214,13 +237,7 @@ class LiteFlowDB:
         """Retrieves an XCom value, loading from disk if necessary."""
         with closing(connect(self.db_path)) as conn:
             row = conn.execute(
-                """
-                SELECT value
-                FROM liteflow_xcom
-                WHERE run_id = ?
-                  AND task_id = ?
-                  AND key = ?
-                """,
+                SQL_GET_XCOM,
                 (run_id, task_id, key),
             ).fetchone()
             if row:
@@ -280,10 +297,7 @@ class Dag:
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
-                    """
-                    INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
-                    VALUES (?, ?, ?)
-                """,
+                    SQL_REGISTER_DAG,
                     (self.dag_id, self.description, int(time.time())),
                 )
 
@@ -304,20 +318,14 @@ class Dag:
             with conn:
                 # Create DAG run
                 conn.execute(
-                    """
-                    INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at)
-                    VALUES (?, ?, ?, ?)
-                    """,
+                    SQL_INSERT_DAG_RUN,
                     (run_id, self.dag_id, Status.PENDING, now),
                 )
 
                 # Snapshot task instances
                 for task_id, task in self.tasks.items():
                     conn.execute(
-                        """
-                        INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?)
-                        """,
+                        SQL_INSERT_TASK_INSTANCE,
                         (
                             run_id,
                             task_id,
