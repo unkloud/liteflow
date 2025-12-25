@@ -150,15 +150,18 @@ def generate_uuid() -> str:
 
 def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
     """Wrapper to execute a task in a separate process."""
+    logger.info(f"Worker executing task {task_id} (Run: {run_id})")
     db = LiteFlowDB(db_path)
     db.set_task_status(run_id, task_id, Status.RUNNING)
     try:
         result = func(**kwargs)
         db.store_xcom(run_id, task_id, "return_value", result)
         db.set_task_status(run_id, task_id, Status.SUCCESS)
+        logger.info(f"Worker finished task {task_id} successfully")
         return None
     except Exception:
         err = traceback.format_exc()
+        logger.error(f"Worker failed task {task_id}: {err}")
         db.set_task_status(run_id, task_id, Status.FAILED, error_log=err)
         return err
 
@@ -181,6 +184,7 @@ class LiteFlowDB:
 
     def _init_schema(self):
         """Initializes the database schema with necessary tables."""
+        logger.debug(f"Initializing DB schema at {self.db_path}")
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.executescript(SQL_INIT_SCHEMA)
@@ -195,6 +199,7 @@ class LiteFlowDB:
         self, run_id: str, task_id: str, status: str, error_log: str = None
     ):
         """Updates the status and timestamp of a specific task."""
+        logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
         with closing(connect(self.db_path)) as conn:
             with conn:
                 if error_log:
@@ -210,12 +215,14 @@ class LiteFlowDB:
 
     def update_run_status(self, run_id: str, status: str):
         """Updates the overall status of a DAG run."""
+        logger.info(f"Updating run {run_id} status to {status}")
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
 
     def store_xcom(self, run_id: str, task_id: str, key: str, value: Any):
         """Stores an XCom value, spilling to disk if too large."""
+        logger.debug(f"Storing XCom for {task_id}.{key} (Run: {run_id})")
         blob = pickle.dumps(value)
         if len(blob) > XCOM_FILE_THRESHOLD:
             xcom_dir = self.db_path + "_xcom"
@@ -235,6 +242,7 @@ class LiteFlowDB:
 
     def get_xcom(self, run_id: str, task_id: str, key: str) -> Any:
         """Retrieves an XCom value, loading from disk if necessary."""
+        logger.debug(f"Retrieving XCom for {task_id}.{key} (Run: {run_id})")
         with closing(connect(self.db_path)) as conn:
             row = conn.execute(
                 SQL_GET_XCOM,
@@ -294,6 +302,7 @@ class Dag:
 
     def register(self):
         """Registers the DAG metadata to the database."""
+        logger.info(f"Registering DAG {self.dag_id}")
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
@@ -307,6 +316,7 @@ class Dag:
             raise ValueError(
                 f"Task with id {task.task_id} already exists in DAG {self.dag_id}"
             )
+        logger.debug(f"Added task {task.task_id} to DAG {self.dag_id}")
         self.tasks[task.task_id] = task
 
     def create_run(self) -> str:
@@ -335,6 +345,7 @@ class Dag:
                             now,
                         ),
                     )
+        logger.info(f"Initialized DAG run {run_id} for DAG {self.dag_id}")
         return run_id
 
     def _resolve_task_kwargs(self, task: Task, run_id: str) -> Dict[str, Any]:
@@ -343,6 +354,7 @@ class Dag:
         kwargs = {}
         for param_name in sig.parameters:
             if param_name in task.dependencies:
+                logger.debug(f"Resolving dependency arg '{param_name}' for task {task.task_id}")
                 val = self.db.get_xcom(run_id, param_name, "return_value")
                 kwargs[param_name] = val
         return kwargs
