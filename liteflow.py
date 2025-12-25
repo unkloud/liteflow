@@ -15,7 +15,8 @@ from dataclasses import dataclass, field
 from functools import wraps
 from typing import Dict, List, Optional, Any, Callable, Union, Set
 
-# --- SQLite Version Check ---
+SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
+SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
 MIN_SQLITE_VERSION = (3, 37, 0)
 if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
     ver_str = ".".join(map(str, MIN_SQLITE_VERSION))
@@ -30,7 +31,6 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("LiteFlow")
-
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 # --- SQL Statements ---
@@ -169,6 +169,8 @@ def connect(db_path: str) -> sqlite3.Connection:
     """Creates and configures a SQLite connection."""
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
+    conn.execute(SQL_PRAGMA_SYNCHRONOUS)
+    conn.execute(SQL_PRAGMA_WAL)
     if sys.version_info >= (3, 12):
         conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
         conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
