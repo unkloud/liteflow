@@ -178,17 +178,18 @@ def connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
+def init_schema(db_path: str):
+    """Initializes the database schema with necessary tables."""
+    logger.debug(f"Initializing DB schema at {db_path}")
+    with closing(connect(db_path)) as conn:
+        with conn:
+            conn.executescript(SQL_INIT_SCHEMA)
+
+
 class LiteFlowDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
-        self._init_schema()
-
-    def _init_schema(self):
-        """Initializes the database schema with necessary tables."""
-        logger.debug(f"Initializing DB schema at {self.db_path}")
-        with closing(connect(self.db_path)) as conn:
-            with conn:
-                conn.executescript(SQL_INIT_SCHEMA)
+        init_schema(self.db_path)
 
     def get_task_states(self, run_id: str) -> Dict[str, str]:
         """Retrieves the current status of all tasks in a run."""

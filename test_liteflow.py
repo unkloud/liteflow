@@ -1,5 +1,6 @@
 import os
 import pickle
+import random
 import shutil
 import sqlite3
 import time
@@ -69,6 +70,10 @@ def large_consumer(producer):
 
 def sleep_1():
     time.sleep(1)
+
+
+def random_sleep_task():
+    time.sleep(random.uniform(0.1, 0.8))
 
 
 class TestLiteFlow(unittest.TestCase):
@@ -361,6 +366,38 @@ class TestLiteFlow(unittest.TestCase):
         # 2.0 would be serial execution time (approx).
         # We expect parallel to be faster.
         self.assertLess(duration, 1.9)
+
+    def test_large_dag_2000(self):
+        with Dag("large_dag_2000", db_path=self.db_path) as dag:
+            # Create a multi-stage DAG with 2000 tasks
+            # 20 layers of 100 tasks each
+            layers = []
+            for i in range(20):
+                layer = [
+                    task(task_id=f"t_{i}_{j}")(random_sleep_task) for j in range(100)
+                ]
+                layers.append(layer)
+
+            # Connect layers to form a mesh
+            for i in range(19):
+                for j in range(100):
+                    # Each task depends on two tasks from the previous layer
+                    layers[i][j] >> layers[i + 1][j]
+                    layers[i][(j + 1) % 100] >> layers[i + 1][j]
+
+        run_id = dag.run()
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
+        self.assertEqual(cursor.fetchone()[0], "SUCCESS")
+
+        cursor.execute(
+            "SELECT count(*) FROM liteflow_task_instances WHERE run_id=? AND status='SUCCESS'",
+            (run_id,),
+        )
+        self.assertEqual(cursor.fetchone()[0], 2000)
+        conn.close()
 
 
 if __name__ == "__main__":
