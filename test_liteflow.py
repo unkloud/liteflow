@@ -67,6 +67,10 @@ def large_consumer(producer):
     return len(producer)
 
 
+def sleep_1():
+    time.sleep(1)
+
+
 class TestLiteFlow(unittest.TestCase):
     def setUp(self):
         self.db_path = "test_liteflow.db"
@@ -282,6 +286,81 @@ class TestLiteFlow(unittest.TestCase):
         # Verify file exists
         self.assertTrue(os.path.exists(self.xcom_dir))
         self.assertGreater(len(os.listdir(self.xcom_dir)), 0)
+
+    def test_circular_dependency(self):
+        with Dag("cycle_dag", db_path=self.db_path) as dag:
+            t1 = task(task_id="t1")(t1_success)
+            t2 = task(task_id="t2")(t1_success)
+            t1 >> t2
+            t2 >> t1
+
+        run_id = dag.run()
+
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
+        status = cursor.fetchone()[0]
+        self.assertEqual(status, "FAILED")
+        conn.close()
+
+    def test_diamond_dependency(self):
+        with Dag("diamond_dag", db_path=self.db_path) as dag:
+            # A -> B -> D
+            # A -> C -> D
+            ta = task(task_id="A")(t1_success)
+            tb = task(task_id="B")(t1_success)
+            tc = task(task_id="C")(t1_success)
+            td = task(task_id="D")(t1_success)
+
+            ta >> [tb, tc]
+            tb >> td
+            tc >> td
+
+        run_id = dag.run()
+
+        states = self.db.get_task_states(run_id)
+        for tid in ["A", "B", "C", "D"]:
+            self.assertEqual(states[tid], "SUCCESS")
+
+    def test_duplicate_task_id(self):
+        with self.assertRaises(ValueError):
+            with Dag("dup_dag", db_path=self.db_path) as dag:
+                task(task_id="t1")(t1_success)
+                task(task_id="t1")(t1_success)
+
+    def test_task_outside_context(self):
+        with self.assertRaises(RuntimeError):
+
+            @task(task_id="orphan")
+            def orphan():
+                pass
+
+    def test_empty_dag(self):
+        with Dag("empty_dag", db_path=self.db_path) as dag:
+            pass
+
+        run_id = dag.run()
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
+        status = cursor.fetchone()[0]
+        self.assertEqual(status, "SUCCESS")
+        conn.close()
+
+    def test_parallel_execution(self):
+        # Two tasks sleeping 1s each. In parallel, should take ~1s, definitely < 2s.
+        with Dag("parallel_dag", db_path=self.db_path) as dag:
+            task(task_id="p1")(sleep_1)
+            task(task_id="p2")(sleep_1)
+
+        start = time.time()
+        dag.run()
+        end = time.time()
+
+        duration = end - start
+        # 2.0 would be serial execution time (approx).
+        # We expect parallel to be faster.
+        self.assertLess(duration, 1.9)
 
 
 if __name__ == "__main__":

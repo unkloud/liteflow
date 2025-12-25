@@ -35,6 +35,15 @@ logger = logging.getLogger("LiteFlow")
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
 
+class Status:
+    """Constants for task and DAG run statuses."""
+
+    PENDING = "PENDING"
+    RUNNING = "RUNNING"
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 @dataclass
 class XComFileRef:
     path: str
@@ -47,15 +56,15 @@ def generate_uuid() -> str:
 def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
     """Wrapper to execute a task in a separate process."""
     db = LiteFlowDB(db_path)
-    db.set_task_status(run_id, task_id, "RUNNING")
+    db.set_task_status(run_id, task_id, Status.RUNNING)
     try:
         result = func(**kwargs)
         db.store_xcom(run_id, task_id, "return_value", result)
-        db.set_task_status(run_id, task_id, "SUCCESS")
+        db.set_task_status(run_id, task_id, Status.SUCCESS)
         return None
     except Exception:
         err = traceback.format_exc()
-        db.set_task_status(run_id, task_id, "FAILED", error_log=err)
+        db.set_task_status(run_id, task_id, Status.FAILED, error_log=err)
         return err
 
 
@@ -65,6 +74,7 @@ class LiteFlowDB:
         self._init_schema()
 
     def _get_conn(self) -> sqlite3.Connection:
+        """Creates and configures a SQLite connection."""
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
         if sys.version_info >= (3, 12):
@@ -74,6 +84,7 @@ class LiteFlowDB:
         return conn
 
     def _init_schema(self):
+        """Initializes the database schema with necessary tables."""
         with closing(self._get_conn()) as conn:
             with conn:
                 conn.executescript(
@@ -127,6 +138,7 @@ class LiteFlowDB:
                 )
 
     def get_task_states(self, run_id: str) -> Dict[str, str]:
+        """Retrieves the current status of all tasks in a run."""
         with closing(self._get_conn()) as conn:
             rows = conn.execute(
                 "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
@@ -137,6 +149,7 @@ class LiteFlowDB:
     def set_task_status(
         self, run_id: str, task_id: str, status: str, error_log: str = None
     ):
+        """Updates the status and timestamp of a specific task."""
         with closing(self._get_conn()) as conn:
             with conn:
                 if error_log:
@@ -164,6 +177,7 @@ class LiteFlowDB:
                     )
 
     def update_run_status(self, run_id: str, status: str):
+        """Updates the overall status of a DAG run."""
         with closing(self._get_conn()) as conn:
             with conn:
                 conn.execute(
@@ -176,6 +190,7 @@ class LiteFlowDB:
                 )
 
     def store_xcom(self, run_id: str, task_id: str, key: str, value: Any):
+        """Stores an XCom value, spilling to disk if too large."""
         blob = pickle.dumps(value)
         if len(blob) > XCOM_FILE_THRESHOLD:
             xcom_dir = self.db_path + "_xcom"
@@ -197,6 +212,7 @@ class LiteFlowDB:
                 )
 
     def get_xcom(self, run_id: str, task_id: str, key: str) -> Any:
+        """Retrieves an XCom value, loading from disk if necessary."""
         with closing(self._get_conn()) as conn:
             row = conn.execute(
                 """
@@ -228,6 +244,7 @@ class Task:
     timeout: int = 3600
 
     def __rshift__(self, other: Union["Task", List["Task"]]):
+        """Allows use of >> operator to set dependencies."""
         if isinstance(other, list):
             for t in other:
                 t.dependencies.add(self.task_id)
@@ -272,6 +289,7 @@ class Dag:
                 )
 
     def add_task(self, task: Task):
+        """Adds a task to the DAG."""
         if task.task_id in self.tasks:
             raise ValueError(
                 f"Task with id {task.task_id} already exists in DAG {self.dag_id}"
@@ -289,9 +307,9 @@ class Dag:
                 conn.execute(
                     """
                     INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at)
-                    VALUES (?, ?, 'PENDING', ?)
+                    VALUES (?, ?, ?, ?)
                     """,
-                    (run_id, self.dag_id, now),
+                    (run_id, self.dag_id, Status.PENDING, now),
                 )
 
                 # Snapshot task instances
@@ -299,17 +317,28 @@ class Dag:
                     conn.execute(
                         """
                         INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
-                        VALUES (?, ?, 'PENDING', ?, ?, ?)
+                        VALUES (?, ?, ?, ?, ?, ?)
                         """,
                         (
                             run_id,
                             task_id,
+                            Status.PENDING,
                             json.dumps(list(task.dependencies)),
                             task.timeout,
                             now,
                         ),
                     )
         return run_id
+
+    def _resolve_task_kwargs(self, task: Task, run_id: str) -> Dict[str, Any]:
+        """Resolves task arguments by fetching XCom values from dependencies."""
+        sig = inspect.signature(task.func)
+        kwargs = {}
+        for param_name in sig.parameters:
+            if param_name in task.dependencies:
+                val = self.db.get_xcom(run_id, param_name, "return_value")
+                kwargs[param_name] = val
+        return kwargs
 
     def run(self, run_id: str = None):
         """Executes the DAG using ProcessPoolExecutor."""
@@ -326,14 +355,14 @@ class Dag:
             ts.prepare()
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
-            self.db.update_run_status(run_id, "FAILED")
+            self.db.update_run_status(run_id, Status.FAILED)
             return run_id
 
         # Get current state of tasks
         task_states = self.db.get_task_states(run_id)
 
         # Mark run as RUNNING
-        self.db.update_run_status(run_id, "RUNNING")
+        self.db.update_run_status(run_id, Status.RUNNING)
 
         futures = {}
         start_times = {}
@@ -342,9 +371,9 @@ class Dag:
             while ts.is_active():
                 ready_tasks = ts.get_ready()
                 for task_id in ready_tasks:
-                    current_status = task_states.get(task_id, "PENDING")
+                    current_status = task_states.get(task_id, Status.PENDING)
 
-                    if current_status == "SUCCESS":
+                    if current_status == Status.SUCCESS:
                         logger.info(f"Task {task_id} already SUCCESS, skipping.")
                         ts.done(task_id)
                         continue
@@ -353,14 +382,7 @@ class Dag:
                     logger.info(f"Scheduling task {task_id}")
                     task = self.tasks[task_id]
 
-                    # Resolve arguments via XCom
-                    sig = inspect.signature(task.func)
-                    kwargs = {}
-                    for param_name in sig.parameters:
-                        if param_name in task.dependencies:
-                            # Fetch XCom from upstream task
-                            val = self.db.get_xcom(run_id, param_name, "return_value")
-                            kwargs[param_name] = val
+                    kwargs = self._resolve_task_kwargs(task, run_id)
 
                     start_times[task_id] = time.time()
                     future = executor.submit(
@@ -390,12 +412,12 @@ class Dag:
                     try:
                         error = future.result()
                         if error:
-                            self.db.update_run_status(run_id, "FAILED")
+                            self.db.update_run_status(run_id, Status.FAILED)
                             return run_id
                         ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
-                        self.db.update_run_status(run_id, "FAILED")
+                        self.db.update_run_status(run_id, Status.FAILED)
                         return run_id
 
                 # Check for timeouts
@@ -406,21 +428,23 @@ class Dag:
                             f"Task {task_id} timed out after {self.tasks[task_id].timeout}s"
                         )
                         self.db.set_task_status(
-                            run_id, task_id, "FAILED", error_log="TimeoutError"
+                            run_id, task_id, Status.FAILED, error_log="TimeoutError"
                         )
-                        self.db.update_run_status(run_id, "FAILED")
+                        self.db.update_run_status(run_id, Status.FAILED)
                         # We can't easily kill the task in ProcessPoolExecutor,
                         # but we can stop the DAG.
                         return run_id
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        self.db.update_run_status(run_id, "SUCCESS")
+        self.db.update_run_status(run_id, Status.SUCCESS)
         logger.info(f"DAG run {run_id} completed successfully.")
         return run_id
 
 
 def task(task_id: str = None, timeout: int = 3600):
+    """Decorator to define a task within a DAG."""
+
     def decorator(func):
         nonlocal task_id
         if task_id is None:
