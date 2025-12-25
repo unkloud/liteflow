@@ -26,7 +26,7 @@ if sqlite3.sqlite_version_info < MIN_SQLITE_VERSION:
 # --- Logging Setup ---
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] [PID:%(process)d TID:%(thread)d] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("LiteFlow")
@@ -36,8 +36,6 @@ XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
 
 class Status:
-    """Constants for task and DAG run statuses."""
-
     PENDING = "PENDING"
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
@@ -68,24 +66,25 @@ def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
         return err
 
 
+def connect(db_path: str) -> sqlite3.Connection:
+    """Creates and configures a SQLite connection."""
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    if sys.version_info >= (3, 12):
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
+        conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_FKEY, True)
+    return conn
+
+
 class LiteFlowDB:
     def __init__(self, db_path: str):
         self.db_path = db_path
         self._init_schema()
 
-    def _get_conn(self) -> sqlite3.Connection:
-        """Creates and configures a SQLite connection."""
-        conn = sqlite3.connect(self.db_path)
-        conn.row_factory = sqlite3.Row
-        if sys.version_info >= (3, 12):
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DDL, False)
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_DQS_DML, False)
-            conn.setconfig(sqlite3.SQLITE_DBCONFIG_ENABLE_FKEY, True)
-        return conn
-
     def _init_schema(self):
         """Initializes the database schema with necessary tables."""
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.executescript(
                     """
@@ -139,7 +138,7 @@ class LiteFlowDB:
 
     def get_task_states(self, run_id: str) -> Dict[str, str]:
         """Retrieves the current status of all tasks in a run."""
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             rows = conn.execute(
                 "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
                 (run_id,),
@@ -150,7 +149,7 @@ class LiteFlowDB:
         self, run_id: str, task_id: str, status: str, error_log: str = None
     ):
         """Updates the status and timestamp of a specific task."""
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 if error_log:
                     conn.execute(
@@ -178,7 +177,7 @@ class LiteFlowDB:
 
     def update_run_status(self, run_id: str, status: str):
         """Updates the overall status of a DAG run."""
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -201,7 +200,7 @@ class LiteFlowDB:
                 f.write(blob)
             blob = pickle.dumps(XComFileRef(path=file_path))
 
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -213,7 +212,7 @@ class LiteFlowDB:
 
     def get_xcom(self, run_id: str, task_id: str, key: str) -> Any:
         """Retrieves an XCom value, loading from disk if necessary."""
-        with closing(self._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             row = conn.execute(
                 """
                 SELECT value
@@ -278,7 +277,7 @@ class Dag:
 
     def register(self):
         """Registers the DAG metadata to the database."""
-        with closing(self.db._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
                     """
@@ -301,7 +300,7 @@ class Dag:
         run_id = generate_uuid()
         now = int(time.time())
 
-        with closing(self.db._get_conn()) as conn:
+        with closing(connect(self.db_path)) as conn:
             with conn:
                 # Create DAG run
                 conn.execute(
