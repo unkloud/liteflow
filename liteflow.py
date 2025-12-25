@@ -33,6 +33,8 @@ logging.basicConfig(
 logger = logging.getLogger("LiteFlow")
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
+
+
 # --- SQL Statements ---
 
 
@@ -60,8 +62,8 @@ class DagRun:
             status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
             created_at INTEGER NOT NULL,
             FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
-        ) STRICT;
-    """
+        ) STRICT; \
+        """
 
     @classmethod
     def create(cls, db_path: str, dag_id: str) -> "DagRun":
@@ -113,8 +115,8 @@ class TaskInstance:
             PRIMARY KEY (run_id, task_id),
             FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
         ) STRICT;
-        CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
-    """
+        CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status); \
+        """
 
     @classmethod
     def create(
@@ -215,8 +217,8 @@ class XCom:
             value   BLOB, -- Pickled Python object
             PRIMARY KEY (run_id, task_id, key),
             FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
-        ) STRICT;
-    """
+        ) STRICT; \
+        """
 
     @classmethod
     def save(cls, db_path: str, run_id: str, task_id: str, key: str, value: Any):
@@ -325,10 +327,10 @@ class Dag:
             description TEXT,
             is_active   INTEGER DEFAULT 1,
             created_at  INTEGER NOT NULL
-        ) STRICT;
-    """
+        ) STRICT; \
+        """
 
-    SQL_REGISTER: ClassVar[
+    SQL_PERSIST_DAG: ClassVar[
         str
     ] = """
         INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
@@ -341,15 +343,15 @@ class Dag:
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         Dag._context = None
-        self.register()
+        self.persist()
 
-    def register(self):
-        """Registers the DAG metadata to the database."""
-        logger.info(f"Registering DAG {self.dag_id}")
+    def persist(self):
+        """Persists the DAG metadata to the database."""
+        logger.info(f"Persisting DAG {self.dag_id}")
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
-                    self.SQL_REGISTER,
+                    self.SQL_PERSIST_DAG,
                     (self.dag_id, self.description, int(time.time())),
                 )
 
