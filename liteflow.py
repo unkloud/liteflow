@@ -34,10 +34,6 @@ logger = logging.getLogger("LiteFlow")
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 # --- SQL Statements ---
-SQL_REGISTER_DAG = """
-    INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
-    VALUES (?, ?, ?)
-"""
 
 
 class Status:
@@ -176,6 +172,25 @@ class TaskInstance:
             ).fetchall()
             return {row["task_id"]: row["status"] for row in rows}
 
+    @staticmethod
+    def execute_wrapper(db_path: str, run_id: str, task_id: str, func, kwargs):
+        """Wrapper to execute a task in a separate process."""
+        logger.info(f"Worker executing task {task_id} (Run: {run_id})")
+        TaskInstance.update_status(db_path, run_id, task_id, Status.RUNNING)
+        try:
+            result = func(**kwargs)
+            XCom.save(db_path, run_id, task_id, "return_value", result)
+            TaskInstance.update_status(db_path, run_id, task_id, Status.SUCCESS)
+            logger.info(f"Worker finished task {task_id} successfully")
+            return None
+        except Exception:
+            err = traceback.format_exc()
+            logger.error(f"Worker failed task {task_id}: {err}")
+            TaskInstance.update_status(
+                db_path, run_id, task_id, Status.FAILED, error_log=err
+            )
+            return err
+
 
 @dataclass
 class XComFileRef:
@@ -248,25 +263,6 @@ def generate_uuid() -> str:
     return str(uuid.uuid4())
 
 
-def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
-    """Wrapper to execute a task in a separate process."""
-    logger.info(f"Worker executing task {task_id} (Run: {run_id})")
-    TaskInstance.update_status(db_path, run_id, task_id, Status.RUNNING)
-    try:
-        result = func(**kwargs)
-        XCom.save(db_path, run_id, task_id, "return_value", result)
-        TaskInstance.update_status(db_path, run_id, task_id, Status.SUCCESS)
-        logger.info(f"Worker finished task {task_id} successfully")
-        return None
-    except Exception:
-        err = traceback.format_exc()
-        logger.error(f"Worker failed task {task_id}: {err}")
-        TaskInstance.update_status(
-            db_path, run_id, task_id, Status.FAILED, error_log=err
-        )
-        return err
-
-
 def connect(db_path: str) -> sqlite3.Connection:
     """Creates and configures a SQLite connection."""
     conn = sqlite3.connect(db_path)
@@ -332,6 +328,13 @@ class Dag:
         ) STRICT;
     """
 
+    SQL_REGISTER: ClassVar[
+        str
+    ] = """
+        INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
+        VALUES (?, ?, ?)
+    """
+
     def __enter__(self):
         Dag._context = self
         return self
@@ -346,7 +349,7 @@ class Dag:
         with closing(connect(self.db_path)) as conn:
             with conn:
                 conn.execute(
-                    SQL_REGISTER_DAG,
+                    self.SQL_REGISTER,
                     (self.dag_id, self.description, int(time.time())),
                 )
 
@@ -432,7 +435,7 @@ class Dag:
 
                     start_times[task_id] = time.time()
                     future = executor.submit(
-                        _execute_task_wrapper,
+                        TaskInstance.execute_wrapper,
                         self.db_path,
                         run_id,
                         task_id,
