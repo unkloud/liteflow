@@ -6,7 +6,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import Dag, task, LiteFlowDB
+from liteflow import Dag, task, LiteFlowDB, get_xcom
 
 
 # Helper functions for tests (must be top-level for pickling)
@@ -273,7 +273,7 @@ class TestLiteFlow(unittest.TestCase):
             task(task_id="t1")(get_pid_wrapper)
 
         run_id = dag.run()
-        task_pid = self.db.get_xcom(run_id, "t1", "return_value")
+        task_pid = get_xcom(self.db_path, run_id, "t1", "return_value")
 
         self.assertIsNotNone(task_pid)
         self.assertNotEqual(task_pid, main_pid)
@@ -285,7 +285,7 @@ class TestLiteFlow(unittest.TestCase):
             t1 >> t2
 
         run_id = dag.run()
-        result = self.db.get_xcom(run_id, "consumer", "return_value")
+        result = get_xcom(self.db_path, run_id, "consumer", "return_value")
         self.assertEqual(result, 11 * 1024 * 1024)
 
         # Verify file exists

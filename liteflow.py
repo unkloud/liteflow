@@ -154,7 +154,7 @@ def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
     db.set_task_status(run_id, task_id, Status.RUNNING)
     try:
         result = func(**kwargs)
-        db.store_xcom(run_id, task_id, "return_value", result)
+        store_xcom(db_path, run_id, task_id, "return_value", result)
         db.set_task_status(run_id, task_id, Status.SUCCESS)
         logger.info(f"Worker finished task {task_id} successfully")
         return None
@@ -222,43 +222,45 @@ class LiteFlowDB:
             with conn:
                 conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
 
-    def store_xcom(self, run_id: str, task_id: str, key: str, value: Any):
-        """Stores an XCom value, spilling to disk if too large."""
-        logger.debug(f"Storing XCom for {task_id}.{key} (Run: {run_id})")
-        blob = pickle.dumps(value)
-        if len(blob) > XCOM_FILE_THRESHOLD:
-            xcom_dir = self.db_path + "_xcom"
-            os.makedirs(xcom_dir, exist_ok=True)
-            filename = f"{run_id}_{task_id}_{key}.bin"
-            file_path = os.path.join(xcom_dir, filename)
-            with open(file_path, "wb") as f:
-                f.write(blob)
-            blob = pickle.dumps(XComFileRef(path=file_path))
 
-        with closing(connect(self.db_path)) as conn:
-            with conn:
-                conn.execute(
-                    SQL_UPSERT_XCOM,
-                    (run_id, task_id, key, blob),
-                )
+def store_xcom(db_path: str, run_id: str, task_id: str, key: str, value: Any):
+    """Stores an XCom value, spilling to disk if too large."""
+    logger.debug(f"Storing XCom for {task_id}.{key} (Run: {run_id})")
+    blob = pickle.dumps(value)
+    if len(blob) > XCOM_FILE_THRESHOLD:
+        xcom_dir = db_path + "_xcom"
+        os.makedirs(xcom_dir, exist_ok=True)
+        filename = f"{run_id}_{task_id}_{key}.bin"
+        file_path = os.path.join(xcom_dir, filename)
+        with open(file_path, "wb") as f:
+            f.write(blob)
+        blob = pickle.dumps(XComFileRef(path=file_path))
 
-    def get_xcom(self, run_id: str, task_id: str, key: str) -> Any:
-        """Retrieves an XCom value, loading from disk if necessary."""
-        logger.debug(f"Retrieving XCom for {task_id}.{key} (Run: {run_id})")
-        with closing(connect(self.db_path)) as conn:
-            row = conn.execute(
-                SQL_GET_XCOM,
-                (run_id, task_id, key),
-            ).fetchone()
-            if row:
-                val = pickle.loads(row["value"])
-                if isinstance(val, XComFileRef):
-                    if not os.path.exists(val.path):
-                        raise FileNotFoundError(f"XCom file missing: {val.path}")
-                    with open(val.path, "rb") as f:
-                        return pickle.loads(f.read())
-                return val
-            return None
+    with closing(connect(db_path)) as conn:
+        with conn:
+            conn.execute(
+                SQL_UPSERT_XCOM,
+                (run_id, task_id, key, blob),
+            )
+
+
+def get_xcom(db_path: str, run_id: str, task_id: str, key: str) -> Any:
+    """Retrieves an XCom value, loading from disk if necessary."""
+    logger.debug(f"Retrieving XCom for {task_id}.{key} (Run: {run_id})")
+    with closing(connect(db_path)) as conn:
+        row = conn.execute(
+            SQL_GET_XCOM,
+            (run_id, task_id, key),
+        ).fetchone()
+        if row:
+            val = pickle.loads(row["value"])
+            if isinstance(val, XComFileRef):
+                if not os.path.exists(val.path):
+                    raise FileNotFoundError(f"XCom file missing: {val.path}")
+                with open(val.path, "rb") as f:
+                    return pickle.loads(f.read())
+            return val
+        return None
 
 
 @dataclass
@@ -359,7 +361,7 @@ class Dag:
                 logger.debug(
                     f"Resolving dependency arg '{param_name}' for task {task.task_id}"
                 )
-                val = self.db.get_xcom(run_id, param_name, "return_value")
+                val = get_xcom(self.db_path, run_id, param_name, "return_value")
                 kwargs[param_name] = val
         return kwargs
 
