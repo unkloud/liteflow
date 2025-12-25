@@ -5,7 +5,7 @@ python_path = Path(__file__).parent.resolve()
 sys.path.insert(0, str(python_path))
 
 from typing import Dict
-from liteflow import Dag, task
+from liteflow import Dag, task, init_schema
 
 
 def extract_data() -> Dict[str, int]:
@@ -27,6 +27,7 @@ def load_data(transform_data: int) -> None:
 def main() -> None:
     """Drive the simple DAG execution."""
     # The db_path will be created automatically if it doesn't exist
+    init_schema("example_flow.db")
     with Dag("simple_etl_dag", db_path="example_flow.db") as dag:
         # Note: Task IDs must match parameter names in downstream functions
         # for automatic XCom resolution.

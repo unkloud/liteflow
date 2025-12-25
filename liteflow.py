@@ -13,7 +13,7 @@ import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
 from functools import wraps
-from typing import Dict, List, Optional, Any, Callable, Union, Set
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar
 
 SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
 SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
@@ -34,101 +34,10 @@ logger = logging.getLogger("LiteFlow")
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 # --- SQL Statements ---
-SQL_INIT_SCHEMA = """
-                  -- 1. Registered DAG definitions (prefixed)
-                  CREATE TABLE IF NOT EXISTS liteflow_dags
-                  (
-                      dag_id      TEXT PRIMARY KEY,
-                      description TEXT,
-                      is_active   INTEGER DEFAULT 1,
-                      created_at  INTEGER NOT NULL
-                  ) STRICT;
-
-                  -- 2. DAG execution instances (prefixed)
-                  CREATE TABLE IF NOT EXISTS liteflow_dag_runs
-                  (
-                      run_id     TEXT PRIMARY KEY,
-                      dag_id     TEXT    NOT NULL,
-                      status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-                      created_at INTEGER NOT NULL,
-                      FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
-                  ) STRICT;
-
-                  -- 3. Individual task node states (prefixed)
-                  CREATE TABLE IF NOT EXISTS liteflow_task_instances
-                  (
-                      run_id       TEXT    NOT NULL,
-                      task_id      TEXT    NOT NULL,
-                      status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
-                      dependencies TEXT,                 -- JSON array of task_id strings
-                      timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
-                      error_log    TEXT,                 -- Stack trace or error message
-                      updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
-                      PRIMARY KEY (run_id, task_id),
-                      FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
-                  ) STRICT;
-
-                  -- 4. Inter-task communication (XCom) (prefixed)
-                  CREATE TABLE IF NOT EXISTS liteflow_xcom
-                  (
-                      run_id  TEXT NOT NULL,
-                      task_id TEXT NOT NULL,
-                      key     TEXT NOT NULL,
-                      value   BLOB, -- Pickled Python object
-                      PRIMARY KEY (run_id, task_id, key),
-                      FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
-                  ) STRICT;
-
-                  CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status); \
-                  """
-
-SQL_GET_TASK_STATES = (
-    "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?"
-)
-
-SQL_UPDATE_TASK_STATUS_ERROR = """
-                               UPDATE liteflow_task_instances
-                               SET status     = ?,
-                                   updated_at = ?,
-                                   error_log  = ?
-                               WHERE run_id = ?
-                                 AND task_id = ? \
-                               """
-
-SQL_UPDATE_TASK_STATUS = """
-                         UPDATE liteflow_task_instances
-                         SET status     = ?,
-                             updated_at = ?
-                         WHERE run_id = ?
-                           AND task_id = ? \
-                         """
-
-SQL_UPDATE_RUN_STATUS = "UPDATE liteflow_dag_runs SET status = ? WHERE run_id = ?"
-
-SQL_UPSERT_XCOM = """
-    INSERT OR REPLACE INTO liteflow_xcom (run_id, task_id, key, value)
-    VALUES (?, ?, ?, ?)
-"""
-
-SQL_GET_XCOM = """
-               SELECT value
-               FROM liteflow_xcom
-               WHERE run_id = ?
-                 AND task_id = ?
-                 AND key = ? \
-               """
-
 SQL_REGISTER_DAG = """
     INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
     VALUES (?, ?, ?)
 """
-
-SQL_INSERT_DAG_RUN = "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)"
-
-SQL_INSERT_TASK_INSTANCE = """
-                           INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
-                           VALUES (?, ?, ?, ?, ?, ?) \
-                           """
 
 
 class Status:
@@ -139,8 +48,200 @@ class Status:
 
 
 @dataclass
+class DagRun:
+    run_id: str
+    dag_id: str
+    status: str
+    created_at: int
+
+    DDL: ClassVar[
+        str
+    ] = """
+        CREATE TABLE IF NOT EXISTS liteflow_dag_runs
+        (
+            run_id     TEXT PRIMARY KEY,
+            dag_id     TEXT    NOT NULL,
+            status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+            created_at INTEGER NOT NULL,
+            FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
+        ) STRICT;
+    """
+
+    @classmethod
+    def create(cls, db_path: str, dag_id: str) -> "DagRun":
+        """Creates a new DAG run entry."""
+        run_id = generate_uuid()
+        now = int(time.time())
+        with closing(connect(db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)",
+                    (run_id, dag_id, Status.PENDING, now),
+                )
+        return cls(run_id=run_id, dag_id=dag_id, status=Status.PENDING, created_at=now)
+
+    @classmethod
+    def update_status(cls, db_path: str, run_id: str, status: str):
+        """Updates the status of this run."""
+        logger.info(f"Updating run {run_id} status to {status}")
+        with closing(connect(db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "UPDATE liteflow_dag_runs SET status = ? WHERE run_id = ?",
+                    (status, run_id),
+                )
+
+
+@dataclass
+class TaskInstance:
+    run_id: str
+    task_id: str
+    status: str
+    dependencies: List[str]
+    timeout: int
+    updated_at: int
+    error_log: Optional[str] = None
+
+    DDL: ClassVar[
+        str
+    ] = """
+        CREATE TABLE IF NOT EXISTS liteflow_task_instances
+        (
+            run_id       TEXT    NOT NULL,
+            task_id      TEXT    NOT NULL,
+            status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+            dependencies TEXT,                 -- JSON array of task_id strings
+            timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
+            error_log    TEXT,                 -- Stack trace or error message
+            updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
+            PRIMARY KEY (run_id, task_id),
+            FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
+    """
+
+    @classmethod
+    def create(
+        cls,
+        db_path: str,
+        run_id: str,
+        task_id: str,
+        dependencies: List[str],
+        timeout: int,
+    ):
+        """Creates a task instance record."""
+        now = int(time.time())
+        with closing(connect(db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    (
+                        run_id,
+                        task_id,
+                        Status.PENDING,
+                        json.dumps(dependencies),
+                        timeout,
+                        now,
+                    ),
+                )
+        return cls(run_id, task_id, Status.PENDING, dependencies, timeout, now)
+
+    @classmethod
+    def update_status(
+        cls, db_path: str, run_id: str, task_id: str, status: str, error_log: str = None
+    ):
+        """Updates the status of a specific task."""
+        logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
+        now = int(time.time())
+        with closing(connect(db_path)) as conn:
+            with conn:
+                if error_log:
+                    conn.execute(
+                        "UPDATE liteflow_task_instances SET status = ?, updated_at = ?, error_log = ? WHERE run_id = ? AND task_id = ?",
+                        (status, now, error_log, run_id, task_id),
+                    )
+                else:
+                    conn.execute(
+                        "UPDATE liteflow_task_instances SET status = ?, updated_at = ? WHERE run_id = ? AND task_id = ?",
+                        (status, now, run_id, task_id),
+                    )
+
+    @classmethod
+    def get_all_states(cls, db_path: str, run_id: str) -> Dict[str, str]:
+        """Retrieves status map for all tasks in a run."""
+        with closing(connect(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
+                (run_id,),
+            ).fetchall()
+            return {row["task_id"]: row["status"] for row in rows}
+
+
+@dataclass
 class XComFileRef:
     path: str
+
+
+@dataclass
+class XCom:
+    run_id: str
+    task_id: str
+    key: str
+    value: Any
+
+    DDL: ClassVar[
+        str
+    ] = """
+        CREATE TABLE IF NOT EXISTS liteflow_xcom
+        (
+            run_id  TEXT NOT NULL,
+            task_id TEXT NOT NULL,
+            key     TEXT NOT NULL,
+            value   BLOB, -- Pickled Python object
+            PRIMARY KEY (run_id, task_id, key),
+            FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
+        ) STRICT;
+    """
+
+    @classmethod
+    def save(cls, db_path: str, run_id: str, task_id: str, key: str, value: Any):
+        """Stores an XCom value, spilling to disk if too large."""
+        logger.debug(f"Storing XCom for {task_id}.{key} (Run: {run_id})")
+        blob = pickle.dumps(value)
+        if len(blob) > XCOM_FILE_THRESHOLD:
+            xcom_dir = db_path + "_xcom"
+            os.makedirs(xcom_dir, exist_ok=True)
+            filename = f"{run_id}_{task_id}_{key}.bin"
+            file_path = os.path.join(xcom_dir, filename)
+            with open(file_path, "wb") as f:
+                f.write(blob)
+            blob = pickle.dumps(XComFileRef(path=file_path))
+
+        with closing(connect(db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT OR REPLACE INTO liteflow_xcom (run_id, task_id, key, value) VALUES (?, ?, ?, ?)",
+                    (run_id, task_id, key, blob),
+                )
+
+    @classmethod
+    def load(cls, db_path: str, run_id: str, task_id: str, key: str) -> Any:
+        """Retrieves an XCom value, loading from disk if necessary."""
+        logger.debug(f"Retrieving XCom for {task_id}.{key} (Run: {run_id})")
+        with closing(connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT value FROM liteflow_xcom WHERE run_id = ? AND task_id = ? AND key = ?",
+                (run_id, task_id, key),
+            ).fetchone()
+            if row:
+                val = pickle.loads(row["value"])
+                if isinstance(val, XComFileRef):
+                    if not os.path.exists(val.path):
+                        raise FileNotFoundError(f"XCom file missing: {val.path}")
+                    with open(val.path, "rb") as f:
+                        return pickle.loads(f.read())
+                return val
+            return None
 
 
 def generate_uuid() -> str:
@@ -150,17 +251,19 @@ def generate_uuid() -> str:
 def _execute_task_wrapper(db_path, run_id, task_id, func, kwargs):
     """Wrapper to execute a task in a separate process."""
     logger.info(f"Worker executing task {task_id} (Run: {run_id})")
-    set_task_status(db_path, run_id, task_id, Status.RUNNING)
+    TaskInstance.update_status(db_path, run_id, task_id, Status.RUNNING)
     try:
         result = func(**kwargs)
-        store_xcom(db_path, run_id, task_id, "return_value", result)
-        set_task_status(db_path, run_id, task_id, Status.SUCCESS)
+        XCom.save(db_path, run_id, task_id, "return_value", result)
+        TaskInstance.update_status(db_path, run_id, task_id, Status.SUCCESS)
         logger.info(f"Worker finished task {task_id} successfully")
         return None
     except Exception:
         err = traceback.format_exc()
         logger.error(f"Worker failed task {task_id}: {err}")
-        set_task_status(db_path, run_id, task_id, Status.FAILED, error_log=err)
+        TaskInstance.update_status(
+            db_path, run_id, task_id, Status.FAILED, error_log=err
+        )
         return err
 
 
@@ -180,82 +283,12 @@ def connect(db_path: str) -> sqlite3.Connection:
 def init_schema(db_path: str):
     """Initializes the database schema with necessary tables."""
     logger.debug(f"Initializing DB schema at {db_path}")
+    # Create tables in topological order
+    entities = [Dag, DagRun, TaskInstance, XCom]
     with closing(connect(db_path)) as conn:
-        with conn:
-            conn.executescript(SQL_INIT_SCHEMA)
-
-
-def get_task_states(db_path: str, run_id: str) -> Dict[str, str]:
-    """Retrieves the current status of all tasks in a run."""
-    with closing(connect(db_path)) as conn:
-        rows = conn.execute(SQL_GET_TASK_STATES, (run_id,)).fetchall()
-        return {row["task_id"]: row["status"] for row in rows}
-
-
-def set_task_status(
-    db_path: str, run_id: str, task_id: str, status: str, error_log: str = None
-):
-    """Updates the status and timestamp of a specific task."""
-    logger.debug(f"Updating task {task_id} status to {status} (Run: {run_id})")
-    with closing(connect(db_path)) as conn:
-        with conn:
-            if error_log:
-                conn.execute(
-                    SQL_UPDATE_TASK_STATUS_ERROR,
-                    (status, int(time.time()), error_log, run_id, task_id),
-                )
-            else:
-                conn.execute(
-                    SQL_UPDATE_TASK_STATUS,
-                    (status, int(time.time()), run_id, task_id),
-                )
-
-
-def update_run_status(db_path: str, run_id: str, status: str):
-    """Updates the overall status of a DAG run."""
-    logger.info(f"Updating run {run_id} status to {status}")
-    with closing(connect(db_path)) as conn:
-        with conn:
-            conn.execute(SQL_UPDATE_RUN_STATUS, (status, run_id))
-
-def store_xcom(db_path: str, run_id: str, task_id: str, key: str, value: Any):
-    """Stores an XCom value, spilling to disk if too large."""
-    logger.debug(f"Storing XCom for {task_id}.{key} (Run: {run_id})")
-    blob = pickle.dumps(value)
-    if len(blob) > XCOM_FILE_THRESHOLD:
-        xcom_dir = db_path + "_xcom"
-        os.makedirs(xcom_dir, exist_ok=True)
-        filename = f"{run_id}_{task_id}_{key}.bin"
-        file_path = os.path.join(xcom_dir, filename)
-        with open(file_path, "wb") as f:
-            f.write(blob)
-        blob = pickle.dumps(XComFileRef(path=file_path))
-
-    with closing(connect(db_path)) as conn:
-        with conn:
-            conn.execute(
-                SQL_UPSERT_XCOM,
-                (run_id, task_id, key, blob),
-            )
-
-
-def get_xcom(db_path: str, run_id: str, task_id: str, key: str) -> Any:
-    """Retrieves an XCom value, loading from disk if necessary."""
-    logger.debug(f"Retrieving XCom for {task_id}.{key} (Run: {run_id})")
-    with closing(connect(db_path)) as conn:
-        row = conn.execute(
-            SQL_GET_XCOM,
-            (run_id, task_id, key),
-        ).fetchone()
-        if row:
-            val = pickle.loads(row["value"])
-            if isinstance(val, XComFileRef):
-                if not os.path.exists(val.path):
-                    raise FileNotFoundError(f"XCom file missing: {val.path}")
-                with open(val.path, "rb") as f:
-                    return pickle.loads(f.read())
-            return val
-        return None
+        for entity in entities:
+            logger.info(f"Creating {entity.__name__}")
+            conn.executescript(entity.DDL)
 
 
 @dataclass
@@ -279,17 +312,25 @@ class Task:
         return f"<Task {self.task_id}>"
 
 
+@dataclass
 class Dag:
-    _context: Optional["Dag"] = None
+    dag_id: str
+    description: str = ""
+    db_path: str = "liteflow.db"
+    tasks: Dict[str, Task] = field(default_factory=dict, init=False)
+    _context: ClassVar[Optional["Dag"]] = None
 
-    def __init__(
-        self, dag_id: str, description: str = "", db_path: str = "liteflow.db"
-    ):
-        self.dag_id = dag_id
-        self.description = description
-        self.tasks: Dict[str, Task] = {}
-        self.db_path = db_path
-        init_schema(self.db_path)
+    DDL: ClassVar[
+        str
+    ] = """
+        CREATE TABLE IF NOT EXISTS liteflow_dags
+        (
+            dag_id      TEXT PRIMARY KEY,
+            description TEXT,
+            is_active   INTEGER DEFAULT 1,
+            created_at  INTEGER NOT NULL
+        ) STRICT;
+    """
 
     def __enter__(self):
         Dag._context = self
@@ -320,30 +361,15 @@ class Dag:
 
     def create_run(self) -> str:
         """Creates a new DAG run and initializes task instances."""
-        run_id = generate_uuid()
-        now = int(time.time())
+        dag_run = DagRun.create(self.db_path, self.dag_id)
+        run_id = dag_run.run_id
 
-        with closing(connect(self.db_path)) as conn:
-            with conn:
-                # Create DAG run
-                conn.execute(
-                    SQL_INSERT_DAG_RUN,
-                    (run_id, self.dag_id, Status.PENDING, now),
-                )
+        # Snapshot task instances
+        for task_id, task in self.tasks.items():
+            TaskInstance.create(
+                self.db_path, run_id, task_id, list(task.dependencies), task.timeout
+            )
 
-                # Snapshot task instances
-                for task_id, task in self.tasks.items():
-                    conn.execute(
-                        SQL_INSERT_TASK_INSTANCE,
-                        (
-                            run_id,
-                            task_id,
-                            Status.PENDING,
-                            json.dumps(list(task.dependencies)),
-                            task.timeout,
-                            now,
-                        ),
-                    )
         logger.info(f"Initialized DAG run {run_id} for DAG {self.dag_id}")
         return run_id
 
@@ -356,7 +382,7 @@ class Dag:
                 logger.debug(
                     f"Resolving dependency arg '{param_name}' for task {task.task_id}"
                 )
-                val = get_xcom(self.db_path, run_id, param_name, "return_value")
+                val = XCom.load(self.db_path, run_id, param_name, "return_value")
                 kwargs[param_name] = val
         return kwargs
 
@@ -375,14 +401,14 @@ class Dag:
             ts.prepare()
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
-            update_run_status(self.db_path, run_id, Status.FAILED)
+            DagRun.update_status(self.db_path, run_id, Status.FAILED)
             return run_id
 
         # Get current state of tasks
-        task_states = get_task_states(self.db_path, run_id)
+        task_states = TaskInstance.get_all_states(self.db_path, run_id)
 
         # Mark run as RUNNING
-        update_run_status(self.db_path, run_id, Status.RUNNING)
+        DagRun.update_status(self.db_path, run_id, Status.RUNNING)
 
         futures = {}
         start_times = {}
@@ -432,12 +458,12 @@ class Dag:
                     try:
                         error = future.result()
                         if error:
-                            update_run_status(self.db_path, run_id, Status.FAILED)
+                            DagRun.update_status(self.db_path, run_id, Status.FAILED)
                             return run_id
                         ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
-                        update_run_status(self.db_path, run_id, Status.FAILED)
+                        DagRun.update_status(self.db_path, run_id, Status.FAILED)
                         return run_id
 
                 # Check for timeouts
@@ -447,17 +473,21 @@ class Dag:
                         logger.error(
                             f"Task {task_id} timed out after {self.tasks[task_id].timeout}s"
                         )
-                        set_task_status(
-                            self.db_path, run_id, task_id, Status.FAILED, error_log="TimeoutError"
+                        TaskInstance.update_status(
+                            self.db_path,
+                            run_id,
+                            task_id,
+                            Status.FAILED,
+                            error_log="TimeoutError",
                         )
-                        update_run_status(self.db_path, run_id, Status.FAILED)
+                        DagRun.update_status(self.db_path, run_id, Status.FAILED)
                         # We can't easily kill the task in ProcessPoolExecutor,
                         # but we can stop the DAG.
                         return run_id
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
-        update_run_status(self.db_path, run_id, Status.SUCCESS)
+        DagRun.update_status(self.db_path, run_id, Status.SUCCESS)
         logger.info(f"DAG run {run_id} completed successfully.")
         return run_id
 

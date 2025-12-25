@@ -6,7 +6,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import Dag, task, get_xcom, get_task_states, init_schema
+from liteflow import Dag, task, init_schema, TaskInstance, XCom, DagRun
 
 
 # Helper functions for tests (must be top-level for pickling)
@@ -255,7 +255,7 @@ class TestLiteFlow(unittest.TestCase):
         self.assertLess(end_time - start_time, 4)
 
         # Check status in DB
-        states = get_task_states(self.db_path, run_id)
+        states = TaskInstance.get_all_states(self.db_path, run_id)
         self.assertEqual(states["slow_task"], "FAILED")
 
         # Check error log
@@ -277,7 +277,7 @@ class TestLiteFlow(unittest.TestCase):
             task(task_id="t1")(get_pid_wrapper)
 
         run_id = dag.run()
-        task_pid = get_xcom(self.db_path, run_id, "t1", "return_value")
+        task_pid = XCom.load(self.db_path, run_id, "t1", "return_value")
 
         self.assertIsNotNone(task_pid)
         self.assertNotEqual(task_pid, main_pid)
@@ -289,7 +289,7 @@ class TestLiteFlow(unittest.TestCase):
             t1 >> t2
 
         run_id = dag.run()
-        result = get_xcom(self.db_path, run_id, "consumer", "return_value")
+        result = XCom.load(self.db_path, run_id, "consumer", "return_value")
         self.assertEqual(result, 11 * 1024 * 1024)
 
         # Verify file exists
@@ -327,7 +327,7 @@ class TestLiteFlow(unittest.TestCase):
 
         run_id = dag.run()
 
-        states = get_task_states(self.db_path, run_id)
+        states = TaskInstance.get_all_states(self.db_path, run_id)
         for tid in ["A", "B", "C", "D"]:
             self.assertEqual(states[tid], "SUCCESS")
 
