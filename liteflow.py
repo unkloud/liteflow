@@ -40,7 +40,6 @@ class XComFileRef:
 
 
 def generate_uuid() -> str:
-    """Generates a UUID v4 string."""
     return str(uuid.uuid4())
 
 
@@ -76,27 +75,27 @@ class LiteFlowDB:
             with conn:
                 conn.executescript(
                     """
-                    -- 1. Registered DAG definitions
-                    CREATE TABLE IF NOT EXISTS dags
+                    -- 1. Registered DAG definitions (prefixed)
+                    CREATE TABLE IF NOT EXISTS liteflow_dags
                     (
                         dag_id      TEXT PRIMARY KEY,
                         description TEXT,
                         is_active   INTEGER DEFAULT 1,
                         created_at  INTEGER NOT NULL
-                    );
+                    ) STRICT;
 
-                    -- 2. DAG execution instances
-                    CREATE TABLE IF NOT EXISTS dag_runs
+                    -- 2. DAG execution instances (prefixed)
+                    CREATE TABLE IF NOT EXISTS liteflow_dag_runs
                     (
                         run_id     TEXT PRIMARY KEY,
                         dag_id     TEXT    NOT NULL,
                         status     TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
                         created_at INTEGER NOT NULL,
-                        FOREIGN KEY (dag_id) REFERENCES dags (dag_id)
-                    );
+                        FOREIGN KEY (dag_id) REFERENCES liteflow_dags (dag_id)
+                    ) STRICT;
 
-                    -- 3. Individual task node states
-                    CREATE TABLE IF NOT EXISTS task_instances
+                    -- 3. Individual task node states (prefixed)
+                    CREATE TABLE IF NOT EXISTS liteflow_task_instances
                     (
                         run_id       TEXT    NOT NULL,
                         task_id      TEXT    NOT NULL,
@@ -106,28 +105,29 @@ class LiteFlowDB:
                         error_log    TEXT,                 -- Stack trace or error message
                         updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
                         PRIMARY KEY (run_id, task_id),
-                        FOREIGN KEY (run_id) REFERENCES dag_runs (run_id)
-                    );
+                        FOREIGN KEY (run_id) REFERENCES liteflow_dag_runs (run_id)
+                    ) STRICT;
 
-                    -- 4. Inter-task communication (XCom)
-                    CREATE TABLE IF NOT EXISTS xcom
+                    -- 4. Inter-task communication (XCom) (prefixed)
+                    CREATE TABLE IF NOT EXISTS liteflow_xcom
                     (
                         run_id  TEXT NOT NULL,
                         task_id TEXT NOT NULL,
                         key     TEXT NOT NULL,
                         value   BLOB, -- Pickled Python object
                         PRIMARY KEY (run_id, task_id, key),
-                        FOREIGN KEY (run_id, task_id) REFERENCES task_instances (run_id, task_id)
-                    );
+                        FOREIGN KEY (run_id, task_id) REFERENCES liteflow_task_instances (run_id, task_id)
+                    ) STRICT;
 
-                    CREATE INDEX IF NOT EXISTS idx_task_instances_status ON task_instances (status);
+                    CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status);
                     """
                 )
 
     def get_task_states(self, run_id: str) -> Dict[str, str]:
         with closing(self._get_conn()) as conn:
             rows = conn.execute(
-                "SELECT task_id, status FROM task_instances WHERE run_id = ?", (run_id,)
+                "SELECT task_id, status FROM liteflow_task_instances WHERE run_id = ?",
+                (run_id,),
             ).fetchall()
             return {row["task_id"]: row["status"] for row in rows}
 
@@ -139,7 +139,7 @@ class LiteFlowDB:
                 if error_log:
                     conn.execute(
                         """
-                        UPDATE task_instances
+                        UPDATE liteflow_task_instances
                         SET status     = ?,
                             updated_at = ?,
                             error_log  = ?
@@ -151,7 +151,7 @@ class LiteFlowDB:
                 else:
                     conn.execute(
                         """
-                        UPDATE task_instances
+                        UPDATE liteflow_task_instances
                         SET status     = ?,
                             updated_at = ?
                         WHERE run_id = ?
@@ -165,7 +165,7 @@ class LiteFlowDB:
             with conn:
                 conn.execute(
                     """
-                    UPDATE dag_runs
+                    UPDATE liteflow_dag_runs
                     SET status = ?
                     WHERE run_id = ?
                     """,
@@ -187,7 +187,7 @@ class LiteFlowDB:
             with conn:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO xcom (run_id, task_id, key, value)
+                    INSERT OR REPLACE INTO liteflow_xcom (run_id, task_id, key, value)
                     VALUES (?, ?, ?, ?)
                 """,
                     (run_id, task_id, key, blob),
@@ -198,7 +198,7 @@ class LiteFlowDB:
             row = conn.execute(
                 """
                 SELECT value
-                FROM xcom
+                FROM liteflow_xcom
                 WHERE run_id = ?
                   AND task_id = ?
                   AND key = ?
@@ -262,7 +262,7 @@ class DAG:
             with conn:
                 conn.execute(
                     """
-                    INSERT OR REPLACE INTO dags (dag_id, description, created_at)
+                    INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
                     VALUES (?, ?, ?)
                 """,
                     (self.dag_id, self.description, int(time.time())),
@@ -285,7 +285,7 @@ class DAG:
                 # Create DAG run
                 conn.execute(
                     """
-                    INSERT INTO dag_runs (run_id, dag_id, status, created_at)
+                    INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at)
                     VALUES (?, ?, 'PENDING', ?)
                     """,
                     (run_id, self.dag_id, now),
@@ -295,7 +295,7 @@ class DAG:
                 for task_id, task in self.tasks.items():
                     conn.execute(
                         """
-                        INSERT INTO task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
+                        INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at)
                         VALUES (?, ?, 'PENDING', ?, ?, ?)
                         """,
                         (

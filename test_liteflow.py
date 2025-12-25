@@ -1,5 +1,8 @@
 import os
+import pickle
+import shutil
 import sqlite3
+import time
 import unittest
 
 from liteflow import DAG, task, LiteFlowDB
@@ -39,13 +42,41 @@ def consumer_func(producer):
     return producer["data"] * 2
 
 
+def slow_task_func():
+    time.sleep(5)
+    return "done"
+
+
+def get_pid_func():
+    return os.getpid()
+
+
+def slow_task_wrapper():
+    return slow_task_func()
+
+
+def get_pid_wrapper():
+    return get_pid_func()
+
+
+def large_producer():
+    return "a" * (11 * 1024 * 1024)
+
+
+def large_consumer(producer):
+    return len(producer)
+
+
 class TestLiteFlow(unittest.TestCase):
     def setUp(self):
         self.db_path = "test_liteflow.db"
+        self.xcom_dir = self.db_path + "_xcom"
         if os.path.exists(self.db_path):
             os.remove(self.db_path)
         if os.path.exists("fail_once.flag"):
             os.remove("fail_once.flag")
+        if os.path.exists(self.xcom_dir):
+            shutil.rmtree(self.xcom_dir)
         self.db = LiteFlowDB(self.db_path)
 
     def tearDown(self):
@@ -53,6 +84,8 @@ class TestLiteFlow(unittest.TestCase):
             os.remove(self.db_path)
         if os.path.exists("fail_once.flag"):
             os.remove("fail_once.flag")
+        if os.path.exists(self.xcom_dir):
+            shutil.rmtree(self.xcom_dir)
 
     def test_dag_registration(self):
         with DAG("test_dag", description="A test DAG", db_path=self.db_path) as dag:
@@ -63,7 +96,7 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT dag_id, description FROM dags WHERE dag_id='test_dag'")
+        cursor.execute("SELECT dag_id, description FROM liteflow_dags WHERE dag_id='test_dag'")
         row = cursor.fetchone()
         self.assertIsNotNone(row)
         self.assertEqual(row[0], "test_dag")
@@ -80,12 +113,12 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM dag_runs WHERE dag_id='success_dag'")
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE dag_id='success_dag'")
         status = cursor.fetchone()[0]
         self.assertEqual(status, "SUCCESS")
 
         cursor.execute(
-            "SELECT task_id, status FROM task_instances WHERE run_id=(SELECT run_id FROM dag_runs WHERE dag_id='success_dag')"
+            "SELECT task_id, status FROM liteflow_task_instances WHERE run_id=(SELECT run_id FROM liteflow_dag_runs WHERE dag_id='success_dag')"
         )
         rows = cursor.fetchall()
         task_statuses = {row[0]: row[1] for row in rows}
@@ -107,12 +140,12 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM dag_runs WHERE dag_id='fail_dag'")
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE dag_id='fail_dag'")
         status = cursor.fetchone()[0]
         self.assertEqual(status, "FAILED")
 
         cursor.execute(
-            "SELECT task_id, status FROM task_instances WHERE run_id=(SELECT run_id FROM dag_runs WHERE dag_id='fail_dag')"
+            "SELECT task_id, status FROM liteflow_task_instances WHERE run_id=(SELECT run_id FROM liteflow_dag_runs WHERE dag_id='fail_dag')"
         )
         rows = cursor.fetchall()
         task_statuses = {row[0]: row[1] for row in rows}
@@ -136,13 +169,13 @@ class TestLiteFlow(unittest.TestCase):
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute(
-            "SELECT status, error_log FROM task_instances WHERE run_id=? AND task_id='t1'",
+            "SELECT status, error_log FROM liteflow_task_instances WHERE run_id=? AND task_id='t1'",
             (run_id,),
         )
         row1 = cursor.fetchone()
         self.assertEqual(row1[0], "SUCCESS", f"t1 failed: {row1[1]}")
         cursor.execute(
-            "SELECT status, error_log FROM task_instances WHERE run_id=? AND task_id='t2'",
+            "SELECT status, error_log FROM liteflow_task_instances WHERE run_id=? AND task_id='t2'",
             (run_id,),
         )
         row2 = cursor.fetchone()
@@ -154,11 +187,11 @@ class TestLiteFlow(unittest.TestCase):
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
-        cursor.execute("SELECT status FROM dag_runs WHERE run_id=?", (run_id,))
+        cursor.execute("SELECT status FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
         self.assertEqual(cursor.fetchone()[0], "SUCCESS")
 
         cursor.execute(
-            "SELECT status FROM task_instances WHERE run_id=? AND task_id='t2'",
+            "SELECT status FROM liteflow_task_instances WHERE run_id=? AND task_id='t2'",
             (run_id,),
         )
         self.assertEqual(cursor.fetchone()[0], "SUCCESS")
@@ -177,22 +210,74 @@ class TestLiteFlow(unittest.TestCase):
 
         # Check producer output
         cursor.execute(
-            "SELECT value FROM xcom WHERE run_id=? AND task_id='producer' AND key='return_value'",
+            "SELECT value FROM liteflow_xcom WHERE run_id=? AND task_id='producer' AND key='return_value'",
             (run_id,),
         )
-        import pickle
-
         val = pickle.loads(cursor.fetchone()[0])
         self.assertEqual(val, {"data": 42})
 
         # Check consumer output
         cursor.execute(
-            "SELECT value FROM xcom WHERE run_id=? AND task_id='consumer' AND key='return_value'",
+            "SELECT value FROM liteflow_xcom WHERE run_id=? AND task_id='consumer' AND key='return_value'",
             (run_id,),
         )
         val = pickle.loads(cursor.fetchone()[0])
         self.assertEqual(val, 84)
         conn.close()
+
+    def test_timeout(self):
+        # This test should verify that a task timing out is marked as FAILED
+        with DAG("timeout_dag", db_path=self.db_path) as dag:
+            task(task_id="slow_task", timeout=1)(slow_task_wrapper)
+
+        start_time = time.time()
+        run_id = dag.run()
+        end_time = time.time()
+
+        # It should have failed around 1 second, not 5
+        self.assertLess(end_time - start_time, 4)
+
+        # Check status in DB
+        states = self.db.get_task_states(run_id)
+        self.assertEqual(states["slow_task"], "FAILED")
+
+        # Check error log
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        cursor.execute(
+            "SELECT error_log FROM liteflow_task_instances WHERE run_id=? AND task_id='slow_task'",
+            (run_id,),
+        )
+        log = cursor.fetchone()[0]
+        self.assertEqual(log, "TimeoutError")
+        conn.close()
+
+    def test_isolation(self):
+        # This test verifies that tasks run in different processes
+        main_pid = os.getpid()
+
+        with DAG("isolation_dag", db_path=self.db_path) as dag:
+            task(task_id="t1")(get_pid_wrapper)
+
+        run_id = dag.run()
+        task_pid = self.db.get_xcom(run_id, "t1", "return_value")
+
+        self.assertIsNotNone(task_pid)
+        self.assertNotEqual(task_pid, main_pid)
+
+    def test_large_xcom(self):
+        with DAG("large_xcom_dag", db_path=self.db_path) as dag:
+            t1 = task(task_id="producer")(large_producer)
+            t2 = task(task_id="consumer")(large_consumer)
+            t1 >> t2
+
+        run_id = dag.run()
+        result = self.db.get_xcom(run_id, "consumer", "return_value")
+        self.assertEqual(result, 11 * 1024 * 1024)
+
+        # Verify file exists
+        self.assertTrue(os.path.exists(self.xcom_dir))
+        self.assertGreater(len(os.listdir(self.xcom_dir)), 0)
 
 
 if __name__ == "__main__":
