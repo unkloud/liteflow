@@ -180,7 +180,8 @@ class TestLiteFlow(unittest.TestCase):
             t2 = task(task_id="t2")(t2_resume)
             t1 >> t2
 
-        run_id = dag.run()
+        dag_run = dag.run()
+        run_id = dag_run.run_id
 
         # Verify failure
         conn = sqlite3.connect(self.db_path)
@@ -200,7 +201,7 @@ class TestLiteFlow(unittest.TestCase):
         conn.close()
 
         # Second run succeeds
-        dag.run(run_id=run_id)
+        dag.run(dag_run=dag_run)
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -220,7 +221,7 @@ class TestLiteFlow(unittest.TestCase):
             t2 = task(task_id="consumer")(consumer_func)
             t1 >> t2
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -248,7 +249,7 @@ class TestLiteFlow(unittest.TestCase):
             task(task_id="slow_task", timeout=1)(slow_task_wrapper)
 
         start_time = time.time()
-        run_id = dag.run()
+        run_id = dag.run().run_id
         end_time = time.time()
 
         # It should have failed around 1 second, not 5
@@ -276,7 +277,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("isolation_dag", db_path=self.db_path) as dag:
             task(task_id="t1")(get_pid_wrapper)
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
         task_pid = XCom.load(self.db_path, run_id, "t1", "return_value")
 
         self.assertIsNotNone(task_pid)
@@ -288,7 +289,7 @@ class TestLiteFlow(unittest.TestCase):
             t2 = task(task_id="consumer")(large_consumer)
             t1 >> t2
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
         result = XCom.load(self.db_path, run_id, "consumer", "return_value")
         self.assertEqual(result, 11 * 1024 * 1024)
 
@@ -303,7 +304,7 @@ class TestLiteFlow(unittest.TestCase):
             t1 >> t2
             t2 >> t1
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
@@ -325,7 +326,7 @@ class TestLiteFlow(unittest.TestCase):
             tb >> td
             tc >> td
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
 
         states = TaskInstance.get_all_states(self.db_path, run_id)
         for tid in ["A", "B", "C", "D"]:
@@ -348,7 +349,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("empty_dag", db_path=self.db_path) as dag:
             pass
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()
         cursor.execute("SELECT status FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
@@ -389,7 +390,7 @@ class TestLiteFlow(unittest.TestCase):
                     layers[i][j] >> layers[i + 1][j]
                     layers[i][(j + 1) % 100] >> layers[i + 1][j]
 
-        run_id = dag.run()
+        run_id = dag.run().run_id
 
         conn = sqlite3.connect(self.db_path)
         cursor = conn.cursor()

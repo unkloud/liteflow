@@ -12,8 +12,7 @@ import traceback
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from functools import wraps
-from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Self
 
 SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
 SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
@@ -355,7 +354,7 @@ class Dag:
                     (self.dag_id, self.description, int(time.time())),
                 )
 
-    def add_task(self, task: Task):
+    def add_task(self, task: Task) -> Self:
         """Adds a task to the DAG."""
         if task.task_id in self.tasks:
             raise ValueError(
@@ -363,20 +362,22 @@ class Dag:
             )
         logger.debug(f"Added task {task.task_id} to DAG {self.dag_id}")
         self.tasks[task.task_id] = task
+        return self
 
-    def create_run(self) -> str:
+    def create_run(self) -> DagRun:
         """Creates a new DAG run and initializes task instances."""
         dag_run = DagRun.create(self.db_path, self.dag_id)
-        run_id = dag_run.run_id
-
-        # Snapshot task instances
         for task_id, task in self.tasks.items():
             TaskInstance.create(
-                self.db_path, run_id, task_id, list(task.dependencies), task.timeout
+                self.db_path,
+                dag_run.run_id,
+                task_id,
+                list(task.dependencies),
+                task.timeout,
             )
 
-        logger.info(f"Initialized DAG run {run_id} for DAG {self.dag_id}")
-        return run_id
+        logger.info(f"Initialized DAG run {dag_run.run_id} for DAG {self.dag_id}")
+        return dag_run
 
     def _resolve_task_kwargs(self, task: Task, run_id: str) -> Dict[str, Any]:
         """Resolves task arguments by fetching XCom values from dependencies."""
@@ -391,10 +392,12 @@ class Dag:
                 kwargs[param_name] = val
         return kwargs
 
-    def run(self, run_id: str = None):
+    def run(self, dag_run: DagRun = None):
         """Executes the DAG using ProcessPoolExecutor."""
-        if run_id is None:
-            run_id = self.create_run()
+        if dag_run is None:
+            dag_run = self.create_run()
+
+        run_id = dag_run.run_id
 
         logger.info(f"Starting DAG run {run_id} for DAG {self.dag_id}")
 
@@ -407,7 +410,7 @@ class Dag:
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
             DagRun.update_status(self.db_path, run_id, Status.FAILED)
-            return run_id
+            return dag_run
 
         # Get current state of tasks
         task_states = TaskInstance.get_all_states(self.db_path, run_id)
@@ -464,12 +467,12 @@ class Dag:
                         error = future.result()
                         if error:
                             DagRun.update_status(self.db_path, run_id, Status.FAILED)
-                            return run_id
+                            return dag_run
                         ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
                         DagRun.update_status(self.db_path, run_id, Status.FAILED)
-                        return run_id
+                        return dag_run
 
                 # Check for timeouts
                 now = time.time()
@@ -488,13 +491,13 @@ class Dag:
                         DagRun.update_status(self.db_path, run_id, Status.FAILED)
                         # We can't easily kill the task in ProcessPoolExecutor,
                         # but we can stop the DAG.
-                        return run_id
+                        return dag_run
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
 
         DagRun.update_status(self.db_path, run_id, Status.SUCCESS)
         logger.info(f"DAG run {run_id} completed successfully.")
-        return run_id
+        return dag_run
 
 
 def task(task_id: str = None, timeout: int = 3600):
@@ -510,10 +513,6 @@ def task(task_id: str = None, timeout: int = 3600):
 
         t = Task(task_id=task_id, func=func, dag=Dag._context, timeout=timeout)
         Dag._context.add_task(t)
-
-        @wraps(func)
-        def wrapper(*args, **kwargs):
-            return func(*args, **kwargs)
 
         return t
 
