@@ -42,6 +42,7 @@ class Status:
     RUNNING = "RUNNING"
     SUCCESS = "SUCCESS"
     FAILED = "FAILED"
+    UP_FOR_RETRY = "UP_FOR_RETRY"
 
 
 @dataclass
@@ -92,6 +93,7 @@ class TaskInstance:
     status: str
     dependencies: List[str]
     timeout: int
+    try_number: int
     updated_at: int
     error_log: Optional[str] = None
 
@@ -102,9 +104,10 @@ class TaskInstance:
         (
             run_id       TEXT    NOT NULL,
             task_id      TEXT    NOT NULL,
-            status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED')),
+            status       TEXT    NOT NULL CHECK (status IN ('PENDING', 'RUNNING', 'SUCCESS', 'FAILED', 'UP_FOR_RETRY')),
             dependencies TEXT,                 -- JSON array of task_id strings
             timeout      INTEGER DEFAULT 3600, -- Max execution time in seconds
+            try_number   INTEGER DEFAULT 1,    -- Attempt number
             error_log    TEXT,                 -- Stack trace or error message
             updated_at   INTEGER NOT NULL,     -- UTC Unix Timestamp
             PRIMARY KEY (run_id, task_id),
@@ -121,23 +124,27 @@ class TaskInstance:
         task_id: str,
         dependencies: List[str],
         timeout: int,
+        try_number: int = 1,
     ):
         """Creates a task instance record."""
         now = int(time.time())
         with closing(connect(db_path)) as conn:
             with conn:
                 conn.execute(
-                    "INSERT INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                    "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
                     (
                         run_id,
                         task_id,
                         Status.PENDING,
                         json.dumps(dependencies),
                         timeout,
+                        try_number,
                         now,
                     ),
                 )
-        return cls(run_id, task_id, Status.PENDING, dependencies, timeout, now)
+        return cls(
+            run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
+        )
 
     def update_status(self, db_path: str, status: str, error_log: str = None):
         """Updates the status of this task instance."""
@@ -267,6 +274,8 @@ class Task:
     arg_dependencies: Dict[str, str] = field(default_factory=dict)
     bound_args: Dict[str, Any] = field(default_factory=dict)
     timeout: int = 3600
+    retries: int = 0
+    retry_delay: int = 0
 
     def execute_worker(self, db_path: str, ti: TaskInstance, kwargs: Dict[str, Any]):
         """Executes the task logic in the worker process."""
@@ -313,7 +322,6 @@ class Dag:
     db_path: str
     description: str = ""
     tasks: Dict[str, Task] = field(default_factory=dict, init=False)
-    _context: ClassVar[Optional["Dag"]] = None
 
     DDL: ClassVar[
         str
@@ -336,11 +344,9 @@ class Dag:
     """
 
     def __enter__(self):
-        Dag._context = self
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
-        Dag._context = None
         self.persist()
 
     def persist(self):
@@ -354,7 +360,13 @@ class Dag:
                 )
 
     def task(
-        self, func: Callable, task_id: str = None, timeout: int = 3600, **kwargs
+        self,
+        func: Callable,
+        task_id: str = None,
+        timeout: int = 3600,
+        retries: int = 0,
+        retry_delay: int = 0,
+        **kwargs,
     ) -> Task:
         """Creates a Task from a function and adds it to the DAG."""
         if task_id is None:
@@ -377,6 +389,8 @@ class Dag:
             dag=self,
             timeout=timeout,
             dependencies=deps,
+            retries=retries,
+            retry_delay=retry_delay,
             arg_dependencies=arg_deps,
             bound_args=bound_args,
         )
@@ -416,6 +430,7 @@ class Dag:
                 task_id,
                 list(task.dependencies),
                 task.timeout,
+                try_number=1,
             )
 
         logger.info(f"Initialized DAG run {dag_run.run_id} for DAG {self.dag_id}")
@@ -459,11 +474,25 @@ class Dag:
         dag_run.update_status(self.db_path, Status.RUNNING)
         futures = {}
         start_times = {}
+        waiting_for_retry = {}  # task_id -> wake_up_timestamp
+        task_retry_counts = {}  # task_id -> current_try_number
+
         executor = concurrent.futures.ProcessPoolExecutor()
         try:
-            while ts.is_active():
-                ready_tasks = ts.get_ready()
-                for task_id in ready_tasks:
+            while ts.is_active() or futures or waiting_for_retry:
+                # 1. Check for retries ready to run
+                now = time.time()
+                ready_retries = []
+                for tid, wake_time in list(waiting_for_retry.items()):
+                    if now >= wake_time:
+                        del waiting_for_retry[tid]
+                        ready_retries.append(tid)
+
+                # 2. Get new ready tasks from graph
+                new_ready_tasks = ts.get_ready() if ts.is_active() else []
+
+                # 3. Schedule tasks
+                for task_id in list(new_ready_tasks) + ready_retries:
                     current_status = task_states.get(task_id, Status.PENDING)
 
                     if current_status == Status.SUCCESS:
@@ -473,15 +502,18 @@ class Dag:
                     # Execute task
                     logger.info(f"Scheduling task {task_id}")
                     task = self.tasks[task_id]
+                    current_try = task_retry_counts.get(task_id, 0) + 1
+                    task_retry_counts[task_id] = current_try
+
                     kwargs = self._resolve_task_kwargs(task, dag_run.run_id)
                     start_times[task_id] = time.time()
-                    ti = TaskInstance(
-                        run_id=dag_run.run_id,
-                        task_id=task_id,
-                        status=Status.PENDING,
-                        dependencies=list(task.dependencies),
-                        timeout=task.timeout,
-                        updated_at=int(time.time()),
+                    ti = TaskInstance.create(
+                        self.db_path,
+                        dag_run.run_id,
+                        task_id,
+                        list(task.dependencies),
+                        task.timeout,
+                        try_number=current_try,
                     )
                     future = executor.submit(
                         task.execute_worker,
@@ -490,16 +522,26 @@ class Dag:
                         kwargs,
                     )
                     futures[future] = task_id
-                if not futures:
+
+                if not futures and not waiting_for_retry:
                     if ts.is_active():
                         raise RuntimeError(
                             f"Deadlock detected in DAG {self.dag_id}: Tasks are pending but none are ready or running."
                         )
                     break
+
                 # Wait for at least one task to finish, or a timeout to occur
-                # We use a short 1s timeout to check for our own task timeouts
+                wait_timeout = 1.0
+                if waiting_for_retry:
+                    next_wake = min(waiting_for_retry.values())
+                    wait_timeout = max(0.1, next_wake - time.time())
+                    # Cap at 1s to ensure we check for timeouts regularly
+                    wait_timeout = min(wait_timeout, 1.0)
+
                 done, _ = concurrent.futures.wait(
-                    futures, timeout=1, return_when=concurrent.futures.FIRST_COMPLETED
+                    futures,
+                    timeout=wait_timeout,
+                    return_when=concurrent.futures.FIRST_COMPLETED,
                 )
                 for future in done:
                     task_id = futures.pop(future)
@@ -507,13 +549,40 @@ class Dag:
                     try:
                         error = future.result()
                         if error:
-                            dag_run.update_status(self.db_path, Status.FAILED)
-                            return dag_run
-                        ts.done(task_id)
+                            # Task failed with exception
+                            task = self.tasks[task_id]
+                            current_try = task_retry_counts.get(task_id, 1)
+                            if current_try <= task.retries:
+                                logger.warning(
+                                    f"Task {task_id} failed. Retrying in {task.retry_delay}s (Attempt {current_try}/{task.retries + 1})"
+                                )
+                                TaskInstance(
+                                    dag_run.run_id,
+                                    task_id,
+                                    Status.FAILED,
+                                    [],
+                                    0,
+                                    current_try,
+                                    0,
+                                ).update_status(
+                                    self.db_path, Status.UP_FOR_RETRY, error_log=error
+                                )
+                                waiting_for_retry[task_id] = (
+                                    time.time() + task.retry_delay
+                                )
+                            else:
+                                logger.error(
+                                    f"Task {task_id} failed and exhausted retries."
+                                )
+                                dag_run.update_status(self.db_path, Status.FAILED)
+                                return dag_run
+                        else:
+                            ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
                         dag_run.update_status(self.db_path, Status.FAILED)
                         return dag_run
+
                 # Check for timeouts
                 now = time.time()
                 for future, task_id in list(futures.items()):
@@ -521,23 +590,39 @@ class Dag:
                         logger.error(
                             f"Task {task_id} timed out after {self.tasks[task_id].timeout}s"
                         )
+                        # Stop tracking this future (fire and forget zombie process)
+                        del futures[future]
+                        start_times.pop(task_id, None)
+
+                        task = self.tasks[task_id]
+                        current_try = task_retry_counts.get(task_id, 1)
+
                         ti = TaskInstance(
                             run_id=dag_run.run_id,
                             task_id=task_id,
                             status=Status.RUNNING,
                             dependencies=list(self.tasks[task_id].dependencies),
                             timeout=self.tasks[task_id].timeout,
+                            try_number=current_try,
                             updated_at=int(now),
                         )
-                        ti.update_status(
-                            self.db_path,
-                            Status.FAILED,
-                            error_log="TimeoutError",
-                        )
-                        dag_run.update_status(self.db_path, Status.FAILED)
-                        # We can't easily kill the task in ProcessPoolExecutor,
-                        # but we can stop the DAG.
-                        return dag_run
+
+                        if current_try <= task.retries:
+                            logger.warning(
+                                f"Task {task_id} timed out. Retrying in {task.retry_delay}s (Attempt {current_try}/{task.retries + 1})"
+                            )
+                            ti.update_status(
+                                self.db_path,
+                                Status.UP_FOR_RETRY,
+                                error_log="TimeoutError",
+                            )
+                            waiting_for_retry[task_id] = time.time() + task.retry_delay
+                        else:
+                            ti.update_status(
+                                self.db_path, Status.FAILED, error_log="TimeoutError"
+                            )
+                            dag_run.update_status(self.db_path, Status.FAILED)
+                            return dag_run
         finally:
             executor.shutdown(wait=False, cancel_futures=True)
         dag_run.update_status(self.db_path, Status.SUCCESS)

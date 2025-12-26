@@ -1,67 +1,51 @@
-import os
-from liteflow import Dag, init_schema
-from pathlib import Path
 import sys
+from pathlib import Path
 
-python_path = Path(__file__).parent.resolve()
-sys.path.insert(0, str(python_path))
+# Add project root to path to import liteflow
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
-
-def fetch_user_data():
-    """Simulates fetching data from an API."""
-    print("Task 1: Fetching data...")
-    return {"user_id": 42, "username": "jdoe", "email": "jdoe@example.com"}
+from typing import Dict
+from liteflow import Dag, init_schema
 
 
-def validate_user(user_profile):
+def extract() -> Dict[str, int]:
+    """Returns data to be used by downstream tasks."""
+    print("Extracting data...")
+    return {"value": 42}
+
+
+def transform(extract: Dict[str, int]) -> int:
     """
-    Validates the user data.
-    The argument 'user_profile' matches the task_id of the upstream task.
+    Receives output from 'extract' task.
+    The argument name 'extract' matches the upstream task ID.
     """
-    print(f"Task 2: Validating user {user_profile['username']}...")
-    if "@" not in user_profile["email"]:
-        raise ValueError("Invalid email")
-    return True
+    print(f"Transforming data: {extract}")
+    return extract["value"] * 2
 
 
-def send_welcome_email(user_profile, validation_result):
-    """
-    Sends an email if validation passed.
-    Depends on 'user_profile' (data) and 'validation_result' (status).
-    """
-    if validation_result:
-        print(f"Task 3: Sending welcome email to {user_profile['email']}...")
-        return "Email Sent"
-    return "Skipped"
+def load(transform: int):
+    """Receives output from 'transform' task."""
+    print(f"Loading data: {transform}")
 
 
-# --- Main Execution ---
-if __name__ == "__main__":
-    db_path = "xcom_demo.db"
-
-    # Clean up previous run for this demo
-    if os.path.exists(db_path):
-        os.remove(db_path)
-
-    # Initialize the database schema
+def main():
+    """Define and run a DAG with data passing (XCom)."""
+    db_path = "examples.db"
     init_schema(db_path)
 
-    # Create the DAG
-    with Dag("onboarding_flow", db_path=db_path) as dag:
-        # Define tasks with IDs matching the arguments of downstream functions
-        t1 = dag.task(fetch_user_data, task_id="user_profile")
-        t2 = dag.task(validate_user, task_id="validation_result")
-        t3 = dag.task(send_welcome_email, task_id="email_status")
+    with Dag("xcom_dag", db_path=db_path) as dag:
+        # Task IDs default to function names: 'extract', 'transform', 'load'
+        t_extract = dag.task(extract)
+        t_transform = dag.task(transform)
+        t_load = dag.task(load)
 
         # Define dependencies
-        # t2 needs t1's output
-        _ = t1 >> t2
+        # Data is passed automatically based on argument names matching task IDs
+        t_extract >> t_transform >> t_load
 
-        # t3 needs both t1 and t2
-        _ = t1 >> t3
-        _ = t2 >> t3
+    print("Running XCom DAG...")
+    dag.run()
 
-    # Run the DAG
-    print("Running DAG...")
-    run = dag.run()
-    print(f"DAG Run Status: {run.status}")
+
+if __name__ == "__main__":
+    main()

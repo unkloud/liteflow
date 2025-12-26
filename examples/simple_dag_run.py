@@ -1,41 +1,39 @@
 import sys
 from pathlib import Path
 
-python_path = Path(__file__).parent.resolve()
-sys.path.insert(0, str(python_path))
+# Add project root to path to import liteflow
+sys.path.insert(0, str(Path(__file__).parents[1]))
 
-from typing import Dict
 from liteflow import Dag, init_schema
 
 
-def extract_data() -> Dict[str, int]:
-    """Simulate data extraction."""
-    return {"value": 42}
+def start_task():
+    print("Task 1: Start")
 
 
-def transform_data(extract_data: Dict[str, int]) -> int:
-    """Simulate data transformation using input from extract_data."""
-    return extract_data["value"] * 2
+def process_task():
+    print("Task 2: Processing")
 
 
-def load_data(transform_data: int) -> str:
-    """Simulate data loading."""
-    # In a real scenario, this would write to a database or API
-    return "Data loaded successfully."
+def end_task():
+    print("Task 3: End")
 
 
 def main():
-    """Drive the simple DAG execution."""
-    # The db_path will be created automatically if it doesn't exist
-    init_schema("example_flow.db")
-    with Dag("simple_etl_dag", db_path="example_flow.db") as dag:
-        # Create tasks from functions
-        t_extract = dag.task(extract_data)
-        t_transform = dag.task(transform_data)
-        t_load = dag.task(load_data)
+    """Define and run a simple linear DAG without data passing."""
+    db_path = "examples.db"
+    init_schema(db_path)
 
-        # Define dependencies
-        t_extract >> t_transform >> t_load
+    with Dag("simple_dag", db_path=db_path) as dag:
+        # Register tasks
+        t1 = dag.task(start_task)
+        t2 = dag.task(process_task)
+        t3 = dag.task(end_task)
+
+        # Define workflow: Start -> Process -> End
+        t1 >> t2 >> t3
+
+    print("Running simple DAG...")
     dag.run()
 
 

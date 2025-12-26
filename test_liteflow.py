@@ -24,6 +24,12 @@ def fail_once():
         raise Exception("Fail once")
 
 
+def fail_twice():
+    # Fails if flag exists (starts at 2), decrements flag
+    # This simulates needing 2 retries (3 attempts total)
+    pass # Logic implemented in test setup via file flags is tricky for counters.
+
+
 def producer():
     return {"val": 42}
 
@@ -307,6 +313,61 @@ class TestLiteFlow(unittest.TestCase):
             # Check dependency was inferred from argument
             self.assertIn("producer", t2.dependencies)
             self.assertEqual(t2.arg_dependencies["data"], "producer")
+
+    def test_retry_success(self):
+        """Test that a task retries and eventually succeeds."""
+        # Create flag for failure
+        with open("fail.flag", "w") as f:
+            f.write("1")
+
+        with Dag("retry_success_dag", db_path=self.db_path) as dag:
+            # fail_once fails if flag exists, then removes it.
+            # So Attempt 1 fails, Attempt 2 succeeds.
+            dag.task(fail_once, task_id="flaky", retries=2, retry_delay=0)
+
+        run = dag.run()
+        self._assert_run_status(run.run_id, "SUCCESS")
+        self._assert_task_status(run.run_id, "flaky", "SUCCESS")
+
+        # Verify try_number was incremented (should be 2)
+        row = self._query(
+            "SELECT try_number FROM liteflow_task_instances WHERE run_id=? AND task_id='flaky'",
+            (run.run_id,),
+        )
+        self.assertEqual(row[0], 2)
+
+    def test_retry_exhausted(self):
+        """Test that a task fails after exhausting retries."""
+        with Dag("retry_fail_dag", db_path=self.db_path) as dag:
+            dag.task(fail, task_id="always_fail", retries=1, retry_delay=0)
+
+        run = dag.run()
+        self._assert_run_status(run.run_id, "FAILED")
+        self._assert_task_status(run.run_id, "always_fail", "FAILED")
+
+        # Should have tried 2 times (1 initial + 1 retry)
+        row = self._query(
+            "SELECT try_number FROM liteflow_task_instances WHERE run_id=? AND task_id='always_fail'",
+            (run.run_id,),
+        )
+        self.assertEqual(row[0], 2)
+
+    def test_retry_timeout(self):
+        """Test that timeouts trigger retries."""
+        with Dag("retry_timeout_dag", db_path=self.db_path) as dag:
+            # Sleep 0.2s, Timeout 0.1s -> Fail. Retry 1 -> Fail again.
+            dag.task(sleep_long, task_id="slow", timeout=1, retries=1, retry_delay=0)
+            # Note: sleep_long sleeps 2s, timeout 1s.
+
+        run = dag.run()
+        self._assert_run_status(run.run_id, "FAILED")
+        
+        # Should have tried 2 times
+        row = self._query(
+            "SELECT try_number FROM liteflow_task_instances WHERE run_id=? AND task_id='slow'",
+            (run.run_id,),
+        )
+        self.assertEqual(row[0], 2)
 
     def test_explicit_dependency_override(self):
         """Test mixing explicit arguments with bitshift operator."""
