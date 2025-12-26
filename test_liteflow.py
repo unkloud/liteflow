@@ -268,6 +268,48 @@ class TestLiteFlow(unittest.TestCase):
             pass
         self._assert_run_status(dag.run().run_id, "SUCCESS")
 
+    def test_delete_dag(self):
+        """Test complete removal of a DAG and its artifacts."""
+        dag1_id = "dag_to_delete"
+        dag2_id = "dag_to_keep"
+
+        # Create and run DAG 1
+        with Dag(dag1_id, db_path=self.db_path) as dag1:
+            dag1.task(noop, task_id="t1")
+        dag1.run()
+
+        # Create and run DAG 2
+        with Dag(dag2_id, db_path=self.db_path) as dag2:
+            dag2.task(noop, task_id="t1")
+        dag2.run()
+
+        # Verify both exist
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_dags WHERE dag_id=?", (dag1_id,))
+        )
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_dags WHERE dag_id=?", (dag2_id,))
+        )
+
+        # Delete DAG 1
+        Dag.delete_dag(self.db_path, dag1_id)
+
+        # Verify DAG 1 is gone (DAG, Runs, Tasks)
+        self.assertIsNone(
+            self._query("SELECT 1 FROM liteflow_dags WHERE dag_id=?", (dag1_id,))
+        )
+        self.assertIsNone(
+            self._query("SELECT 1 FROM liteflow_dag_runs WHERE dag_id=?", (dag1_id,))
+        )
+
+        # Verify DAG 2 is unaffected
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_dags WHERE dag_id=?", (dag2_id,))
+        )
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_dag_runs WHERE dag_id=?", (dag2_id,))
+        )
+
     def test_parallel_execution(self):
         with Dag("parallel_dag", db_path=self.db_path) as dag:
             dag.task(sleep_1s, task_id="p1")

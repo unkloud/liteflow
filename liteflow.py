@@ -631,6 +631,50 @@ class Dag:
         return dag_run
 
     @classmethod
+    def delete_dag(cls, db_path: str, dag_id: str):
+        """Deletes a DAG and all associated runs, tasks, and XComs."""
+        logger.info(f"Deleting DAG {dag_id} from {db_path}")
+
+        # 1. Identify runs to clean up external XCom files
+        with closing(connect(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT run_id FROM liteflow_dag_runs WHERE dag_id = ?", (dag_id,)
+            ).fetchall()
+            run_ids = {row["run_id"] for row in rows}
+
+        # 2. Clean up XCom files on disk
+        xcom_dir = db_path + "_xcom"
+        if os.path.exists(xcom_dir) and run_ids:
+            for filename in os.listdir(xcom_dir):
+                # Filename format: {run_id}_{task_id}_{key}.bin
+                parts = filename.split("_", 1)
+                if parts and parts[0] in run_ids:
+                    try:
+                        os.remove(os.path.join(xcom_dir, filename))
+                    except OSError as e:
+                        logger.warning(f"Failed to delete XCom file {filename}: {e}")
+
+        # 3. Database cleanup (Child tables first)
+        with closing(connect(db_path)) as conn:
+            with conn:
+                # Delete XCom entries
+                conn.execute(
+                    "DELETE FROM liteflow_xcom WHERE run_id IN (SELECT run_id FROM liteflow_dag_runs WHERE dag_id = ?)",
+                    (dag_id,),
+                )
+                # Delete TaskInstances
+                conn.execute(
+                    "DELETE FROM liteflow_task_instances WHERE run_id IN (SELECT run_id FROM liteflow_dag_runs WHERE dag_id = ?)",
+                    (dag_id,),
+                )
+                # Delete DagRuns
+                conn.execute(
+                    "DELETE FROM liteflow_dag_runs WHERE dag_id = ?", (dag_id,)
+                )
+                # Delete Dag
+                conn.execute("DELETE FROM liteflow_dags WHERE dag_id = ?", (dag_id,))
+
+    @classmethod
     def load(cls, db_path: str, dag_id: str) -> Self:
         """Loads a DAG from the database."""
         with closing(connect(db_path)) as conn:
