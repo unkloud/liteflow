@@ -37,6 +37,12 @@ XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 # --- SQL Statements ---
 
 
+class DagExistsError(Exception):
+    """Raised when attempting to persist a DAG that already exists."""
+
+    pass
+
+
 class Status:
     PENDING = "PENDING"
     RUNNING = "RUNNING"
@@ -339,7 +345,7 @@ class Dag:
     SQL_PERSIST_DAG: ClassVar[
         str
     ] = """
-        INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
+        INSERT INTO liteflow_dags (dag_id, description, created_at)
         VALUES (?, ?, ?)
     """
 
@@ -354,10 +360,13 @@ class Dag:
         logger.info(f"Persisting DAG {self.dag_id}")
         with closing(connect(self.db_path)) as conn:
             with conn:
-                conn.execute(
-                    self.SQL_PERSIST_DAG,
-                    (self.dag_id, self.description, int(time.time())),
-                )
+                try:
+                    conn.execute(
+                        self.SQL_PERSIST_DAG,
+                        (self.dag_id, self.description, int(time.time())),
+                    )
+                except sqlite3.IntegrityError:
+                    raise DagExistsError(f"DAG with id '{self.dag_id}' already exists.")
 
     def task(
         self,
@@ -638,3 +647,7 @@ class Dag:
                     description=row["description"],
                 )
             raise ValueError(f"DAG with ID '{dag_id}' not found in database.")
+
+
+if __name__ == "__main__":
+    pass
