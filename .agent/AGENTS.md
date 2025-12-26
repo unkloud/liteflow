@@ -36,6 +36,8 @@ For every requested change, follow this strict protocol:
 - **Documentation**: Limit comments to complex logic only. Break complex logic into smaller, self-explanatory
   components.
 - **Testing**: Provide simple unit tests for any complex functions or logic introduced.
+- When a prompt starts with "question:", do not change anything or propose changes, only provide a response as accurate
+  as possible.
 
 ## Language-Specific Standards
 

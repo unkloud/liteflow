@@ -6,7 +6,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import Dag, task, init_schema, XCom
+from liteflow import Dag, init_schema, XCom, Task
 
 
 # --- Helper functions (must be top-level for pickling) ---
@@ -97,7 +97,7 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_dag_registration(self):
         with Dag("test_dag", description="A test DAG", db_path=self.db_path) as dag:
-            task(task_id="t1")(noop)
+            dag.task(noop, task_id="t1")
 
         row = self._query(
             "SELECT description FROM liteflow_dags WHERE dag_id='test_dag'"
@@ -106,8 +106,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_dag_execution_success(self):
         with Dag("success_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="t1")(noop)
-            t2 = task(task_id="t2")(noop)
+            t1 = dag.task(noop, task_id="t1")
+            t2 = dag.task(noop, task_id="t2")
             _ = t1 >> t2
 
         run = dag.run()
@@ -117,8 +117,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_dag_execution_failure(self):
         with Dag("fail_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="t1")(fail)
-            t2 = task(task_id="t2")(noop)
+            t1 = dag.task(fail, task_id="t1")
+            t2 = dag.task(noop, task_id="t2")
             _ = t1 >> t2
 
         run = dag.run()
@@ -132,8 +132,8 @@ class TestLiteFlow(unittest.TestCase):
             f.write("1")
 
         with Dag("resume_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="t1")(noop)
-            t2 = task(task_id="t2")(fail_once)
+            t1 = dag.task(noop, task_id="t1")
+            t2 = dag.task(fail_once, task_id="t2")
             _ = t1 >> t2
 
         # Run 1: Fails at t2
@@ -148,8 +148,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_xcom_passing(self):
         with Dag("xcom_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="producer")(producer)
-            t2 = task(task_id="consumer")(consumer)
+            t1 = dag.task(producer, task_id="producer")
+            t2 = dag.task(consumer, task_id="consumer")
             _ = t1 >> t2
 
         dag_run = dag.run()
@@ -167,7 +167,7 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_timeout(self):
         with Dag("timeout_dag", db_path=self.db_path) as dag:
-            task(task_id="slow", timeout=1)(sleep_long)
+            dag.task(sleep_long, task_id="slow", timeout=1)
 
         start_time = time.time()
         run = dag.run()
@@ -184,7 +184,7 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_isolation(self):
         with Dag("isolation_dag", db_path=self.db_path) as dag:
-            task(task_id="t1")(get_pid)
+            dag.task(get_pid, task_id="t1")
 
         run_id = dag.run().run_id
         task_pid = XCom.load(self.db_path, run_id, "t1", "return_value")
@@ -192,8 +192,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_large_xcom(self):
         with Dag("large_xcom_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="producer")(large_producer)
-            t2 = task(task_id="consumer")(large_consumer)
+            t1 = dag.task(large_producer, task_id="producer")
+            t2 = dag.task(large_consumer, task_id="consumer")
             _ = t1 >> t2
 
         run_id = dag.run().run_id
@@ -203,8 +203,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_circular_dependency(self):
         with Dag("cycle_dag", db_path=self.db_path) as dag:
-            t1 = task(task_id="t1")(noop)
-            t2 = task(task_id="t2")(noop)
+            t1 = dag.task(noop, task_id="t1")
+            t2 = dag.task(noop, task_id="t2")
             _ = t1 >> t2
             _ = t2 >> t1
 
@@ -213,10 +213,10 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_diamond_dependency(self):
         with Dag("diamond_dag", db_path=self.db_path) as dag:
-            ta = task(task_id="A")(noop)
-            tb = task(task_id="B")(noop)
-            tc = task(task_id="C")(noop)
-            td = task(task_id="D")(noop)
+            ta = dag.task(noop, task_id="A")
+            tb = dag.task(noop, task_id="B")
+            tc = dag.task(noop, task_id="C")
+            td = dag.task(noop, task_id="D")
             _ = ta >> [tb, tc]
             _ = tb >> td
             _ = tc >> td
@@ -227,15 +227,8 @@ class TestLiteFlow(unittest.TestCase):
     def test_duplicate_task_id(self):
         with self.assertRaises(ValueError):
             with Dag("dup_dag", db_path=self.db_path) as dag:
-                task(task_id="t1")(noop)
-                task(task_id="t1")(noop)
-
-    def test_task_outside_context(self):
-        with self.assertRaises(RuntimeError):
-
-            @task(task_id="orphan")
-            def orphan():
-                pass
+                dag.task(noop, task_id="t1")
+                dag.task(noop, task_id="t1")
 
     def test_empty_dag(self):
         with Dag("empty_dag", db_path=self.db_path) as dag:
@@ -244,8 +237,8 @@ class TestLiteFlow(unittest.TestCase):
 
     def test_parallel_execution(self):
         with Dag("parallel_dag", db_path=self.db_path) as dag:
-            task(task_id="p1")(sleep_1s)
-            task(task_id="p2")(sleep_1s)
+            dag.task(sleep_1s, task_id="p1")
+            dag.task(sleep_1s, task_id="p2")
 
         start = time.time()
         dag.run()
@@ -255,7 +248,7 @@ class TestLiteFlow(unittest.TestCase):
     def test_large_dag_2000(self):
         with Dag("large_dag_2000", db_path=self.db_path) as dag:
             layers = [
-                [task(task_id=f"t_{i}_{j}")(sleep_random) for j in range(100)]
+                [dag.task(sleep_random, task_id=f"t_{i}_{j}") for j in range(100)]
                 for i in range(20)
             ]
             for i in range(19):
@@ -270,3 +263,53 @@ class TestLiteFlow(unittest.TestCase):
             (run.run_id,),
         )
         self.assertEqual(cnt[0], 2000)
+
+    def test_execution_outside_dag(self):
+        """Test that decorated tasks run as normal functions outside a DAG."""
+
+        def add(a, b):
+            return a + b
+
+        result = add(5, 7)
+        self.assertEqual(result, 12)
+
+    def test_composition_inside_dag(self):
+        """Test that calling tasks inside a DAG creates Task nodes."""
+
+        def producer():
+            return 1
+
+        def consumer(data):
+            return data + 1
+
+        with Dag("test_dag_deferred", db_path=self.db_path) as dag:
+            t1 = dag.task(producer)
+            t2 = dag.task(consumer, data=t1)
+
+            # Check tasks were added
+            self.assertIn("producer", dag.tasks)
+            self.assertIn("consumer", dag.tasks)
+
+            # Check t1 is a Task instance
+            self.assertIsInstance(t1, Task)
+            self.assertEqual(t1.task_id, "producer")
+
+            # Check dependency was inferred from argument
+            self.assertIn("producer", t2.dependencies)
+            self.assertEqual(t2.arg_dependencies["data"], "producer")
+
+    def test_explicit_dependency_override(self):
+        """Test mixing explicit arguments with bitshift operator."""
+
+        def step1():
+            pass
+
+        def step2():
+            pass
+
+        with Dag("mix_dag", db_path=self.db_path) as dag:
+            t1 = dag.task(step1)
+            t2 = dag.task(step2)
+            _ = t1 >> t2
+
+            self.assertIn("step1", t2.dependencies)

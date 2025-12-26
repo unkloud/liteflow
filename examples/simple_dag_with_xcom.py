@@ -1,5 +1,5 @@
 import os
-from liteflow import Dag, task, init_schema
+from liteflow import Dag, init_schema
 from pathlib import Path
 import sys
 
@@ -49,9 +49,9 @@ if __name__ == "__main__":
     # Create the DAG
     with Dag("onboarding_flow", db_path=db_path) as dag:
         # Define tasks with IDs matching the arguments of downstream functions
-        t1 = task(task_id="user_profile")(fetch_user_data)
-        t2 = task(task_id="validation_result")(validate_user)
-        t3 = task(task_id="email_status")(send_welcome_email)
+        t1 = dag.task(fetch_user_data, task_id="user_profile")
+        t2 = dag.task(validate_user, task_id="validation_result")
+        t3 = dag.task(send_welcome_email, task_id="email_status")
 
         # Define dependencies
         # t2 needs t1's output

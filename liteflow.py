@@ -12,7 +12,7 @@ import traceback
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Self
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar
 
 SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
 SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
@@ -175,23 +175,6 @@ class TaskInstance:
         if error_log:
             self.error_log = error_log
 
-    @staticmethod
-    def execute_wrapper(db_path: str, ti: "TaskInstance", func, kwargs):
-        """Wrapper to execute a task in a separate process."""
-        logger.info(f"Worker executing task {ti.task_id} (Run: {ti.run_id})")
-        ti.update_status(db_path, Status.RUNNING)
-        try:
-            result = func(**kwargs)
-            XCom.save(db_path, ti.run_id, ti.task_id, "return_value", result)
-            ti.update_status(db_path, Status.SUCCESS)
-            logger.info(f"Worker finished task {ti.task_id} successfully")
-            return None
-        except Exception:
-            err = traceback.format_exc()
-            logger.error(f"Worker failed task {ti.task_id}: {err}")
-            ti.update_status(db_path, Status.FAILED, error_log=err)
-            return err
-
 
 @dataclass
 class XComFileRef:
@@ -292,9 +275,28 @@ def init_schema(db_path: str):
 class Task:
     task_id: str
     func: Callable
-    dag: "Dag"
+    dag: Optional["Dag"] = None
     dependencies: Set[str] = field(default_factory=set)
+    arg_dependencies: Dict[str, str] = field(default_factory=dict)
+    bound_args: Dict[str, Any] = field(default_factory=dict)
     timeout: int = 3600
+
+    def execute_worker(self, db_path: str, ti: TaskInstance, kwargs: Dict[str, Any]):
+        """Executes the task logic in the worker process."""
+        logger.info(f"Worker executing task {ti.task_id} (Run: {ti.run_id})")
+        ti.update_status(db_path, Status.RUNNING)
+        try:
+            # Execute the actual user function
+            result = self.func(**kwargs)
+            XCom.save(db_path, ti.run_id, ti.task_id, "return_value", result)
+            ti.update_status(db_path, Status.SUCCESS)
+            logger.info(f"Worker finished task {ti.task_id} successfully")
+            return None
+        except Exception:
+            err = traceback.format_exc()
+            logger.error(f"Worker failed task {ti.task_id}: {err}")
+            ti.update_status(db_path, Status.FAILED, error_log=err)
+            return err
 
     def __rshift__(self, other: Union["Task", List["Task"]]):
         """Allows use of >> operator to set dependencies."""
@@ -308,12 +310,21 @@ class Task:
     def __repr__(self):
         return f"<Task {self.task_id}>"
 
+    def __getstate__(self):
+        # Prevent pickling the DAG object to the worker
+        state = self.__dict__.copy()
+        state["dag"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+
 
 @dataclass
 class Dag:
     dag_id: str
+    db_path: str
     description: str = ""
-    db_path: str = "liteflow.db"
     tasks: Dict[str, Task] = field(default_factory=dict, init=False)
     _context: ClassVar[Optional["Dag"]] = None
 
@@ -326,7 +337,8 @@ class Dag:
             description TEXT,
             is_active   INTEGER DEFAULT 1,
             created_at  INTEGER NOT NULL
-        ) STRICT; \
+        ) STRICT;
+        CREATE INDEX IF NOT EXISTS idx_liteflow_dags_dag_id ON liteflow_dags (dag_id); \
         """
 
     SQL_PERSIST_DAG: ClassVar[
@@ -354,15 +366,45 @@ class Dag:
                     (self.dag_id, self.description, int(time.time())),
                 )
 
-    def add_task(self, task: Task) -> Self:
+    def task(
+        self, func: Callable, task_id: str = None, timeout: int = 3600, **kwargs
+    ) -> Task:
+        """Creates a Task from a function and adds it to the DAG."""
+        if task_id is None:
+            task_id = func.__name__
+
+        deps = set()
+        arg_deps = {}
+        bound_args = {}
+
+        for param_name, val in kwargs.items():
+            if isinstance(val, Task):
+                deps.add(val.task_id)
+                arg_deps[param_name] = val.task_id
+            else:
+                bound_args[param_name] = val
+
+        t = Task(
+            task_id=task_id,
+            func=func,
+            dag=self,
+            timeout=timeout,
+            dependencies=deps,
+            arg_dependencies=arg_deps,
+            bound_args=bound_args,
+        )
+        return self.add_task(t)
+
+    def add_task(self, task: Task) -> Task:
         """Adds a task to the DAG."""
         if task.task_id in self.tasks:
             raise ValueError(
                 f"Task with id {task.task_id} already exists in DAG {self.dag_id}"
             )
         logger.debug(f"Added task {task.task_id} to DAG {self.dag_id}")
+        task.dag = self
         self.tasks[task.task_id] = task
-        return self
+        return task
 
     def create_run(self) -> DagRun:
         """Creates a new DAG run and initializes task instances."""
@@ -382,13 +424,17 @@ class Dag:
     def _resolve_task_kwargs(self, task: Task, run_id: str) -> Dict[str, Any]:
         """Resolves task arguments by fetching XCom values from dependencies."""
         sig = inspect.signature(task.func)
-        kwargs = {}
+        kwargs = task.bound_args.copy()
         for param_name in sig.parameters:
-            if param_name in task.dependencies:
+            upstream_task_id = task.arg_dependencies.get(param_name)
+            if not upstream_task_id and param_name in task.dependencies:
+                upstream_task_id = param_name
+
+            if upstream_task_id:
                 logger.debug(
-                    f"Resolving dependency arg '{param_name}' for task {task.task_id}"
+                    f"Resolving dependency arg '{param_name}' for task {task.task_id} from {upstream_task_id}"
                 )
-                val = XCom.load(self.db_path, run_id, param_name, "return_value")
+                val = XCom.load(self.db_path, run_id, upstream_task_id, "return_value")
                 kwargs[param_name] = val
         return kwargs
 
@@ -437,16 +483,17 @@ class Dag:
                         updated_at=int(time.time()),
                     )
                     future = executor.submit(
-                        TaskInstance.execute_wrapper,
+                        task.execute_worker,
                         self.db_path,
                         ti,
-                        task.func,
                         kwargs,
                     )
                     futures[future] = task_id
                 if not futures:
                     if ts.is_active():
-                        continue
+                        raise RuntimeError(
+                            f"Deadlock detected in DAG {self.dag_id}: Tasks are pending but none are ready or running."
+                        )
                     break
                 # Wait for at least one task to finish, or a timeout to occur
                 # We use a short 1s timeout to check for our own task timeouts
@@ -495,19 +542,3 @@ class Dag:
         dag_run.update_status(self.db_path, Status.SUCCESS)
         logger.info(f"DAG run {dag_run.run_id} completed successfully.")
         return dag_run
-
-
-def task(task_id: str = None, timeout: int = 3600):
-    """Decorator to define a task within a DAG."""
-
-    def decorator(func):
-        nonlocal task_id
-        if task_id is None:
-            task_id = func.__name__
-        if Dag._context is None:
-            raise RuntimeError("Tasks must be defined within a DAG context")
-        t = Task(task_id=task_id, func=func, dag=Dag._context, timeout=timeout)
-        Dag._context.add_task(t)
-        return t
-
-    return decorator
