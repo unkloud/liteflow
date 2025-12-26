@@ -7,7 +7,7 @@ import sqlite3
 import time
 import unittest
 
-from liteflow import Dag, init_schema, XCom, Task, DagExistsError
+from liteflow import Dag, init_schema, XCom, Task
 
 
 # --- Helper functions (must be top-level for pickling) ---
@@ -252,15 +252,6 @@ class TestLiteFlow(unittest.TestCase):
         with self.assertRaises(ValueError):
             with Dag("dup_dag", db_path=self.db_path) as dag:
                 dag.task(noop, task_id="t1")
-                dag.task(noop, task_id="t1")
-
-    def test_duplicate_dag_persistence(self):
-        dag_id = "dup_dag_persist"
-        with Dag(dag_id, db_path=self.db_path) as dag:
-            dag.task(noop, task_id="t1")
-
-        with self.assertRaises(DagExistsError):
-            with Dag(dag_id, db_path=self.db_path) as dag:
                 dag.task(noop, task_id="t1")
 
     def test_empty_dag(self):

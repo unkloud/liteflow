@@ -1,3 +1,5 @@
+#!/usr/bin/env python3
+
 import concurrent.futures
 import graphlib
 import inspect
@@ -35,12 +37,6 @@ XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
 
 # --- SQL Statements ---
-
-
-class DagExistsError(Exception):
-    """Raised when attempting to persist a DAG that already exists."""
-
-    pass
 
 
 class Status:
@@ -345,9 +341,9 @@ class Dag:
     SQL_PERSIST_DAG: ClassVar[
         str
     ] = """
-        INSERT INTO liteflow_dags (dag_id, description, created_at)
-        VALUES (?, ?, ?)
-    """
+        INSERT OR REPLACE INTO liteflow_dags (dag_id, description, created_at)
+        VALUES (?, ?, ?) \
+        """
 
     def __enter__(self):
         return self
@@ -360,13 +356,10 @@ class Dag:
         logger.info(f"Persisting DAG {self.dag_id}")
         with closing(connect(self.db_path)) as conn:
             with conn:
-                try:
-                    conn.execute(
-                        self.SQL_PERSIST_DAG,
-                        (self.dag_id, self.description, int(time.time())),
-                    )
-                except sqlite3.IntegrityError:
-                    raise DagExistsError(f"DAG with id '{self.dag_id}' already exists.")
+                conn.execute(
+                    self.SQL_PERSIST_DAG,
+                    (self.dag_id, self.description, int(time.time())),
+                )
 
     def task(
         self,
@@ -694,4 +687,72 @@ class Dag:
 
 
 if __name__ == "__main__":
-    pass
+    import argparse
+
+    parser = argparse.ArgumentParser(description="LiteFlow CLI")
+    subparsers = parser.add_subparsers(dest="command", required=True)
+    # List
+    list_parser = subparsers.add_parser("list", help="List all DAGs")
+    list_parser.add_argument("--db", required=True, help="Path to SQLite database")
+    # Delete
+    del_parser = subparsers.add_parser("delete", help="Delete a DAG")
+    del_parser.add_argument("dag_id", help="ID of the DAG to delete")
+    del_parser.add_argument("--db", required=True, help="Path to SQLite database")
+    # Scaffold
+    scaffold_parser = subparsers.add_parser("scaffold", help="Generate a DAG template")
+    args = parser.parse_args()
+    if args.command == "list":
+        if not os.path.exists(args.db):
+            print(f"Database not found at {args.db}")
+            sys.exit(1)
+        with closing(connect(args.db)) as conn:
+            rows = conn.execute(
+                "SELECT dag_id, description, created_at FROM liteflow_dags"
+            ).fetchall()
+            if not rows:
+                print("No DAGs found.")
+            else:
+                print(f"{'DAG ID':<30} | {'Created At':<20} | {'Description'}")
+                print("-" * 80)
+                for row in rows:
+                    created = time.strftime(
+                        "%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"])
+                    )
+                    print(f"{row['dag_id']:<30} | {created:<20} | {row['description']}")
+    elif args.command == "delete":
+        if not os.path.exists(args.db):
+            print(f"Database not found at {args.db}")
+            sys.exit(1)
+        Dag.delete_dag(args.db, args.dag_id)
+        print(f"Deleted DAG '{args.dag_id}' and associated data.")
+
+    elif args.command == "scaffold":
+        template = f"""import os
+import os
+from liteflow import Dag, init_schema
+
+
+def task_1():
+    print("Hello from Task 1")
+
+
+def main():
+    # Use DB path from env (CLI) or default
+    db_path = os.getenv("LITEFLOW_DB_PATH", "liteflow.db")
+    init_schema(db_path)
+
+    with Dag("my_new_dag", db_path=db_path, description="Auto-generated DAG") as dag:
+        t1 = dag.task(
+            task_1,
+            task_id="task1",
+        )
+        t2 = dag.task(task_1, task_id="task2")
+        _ = t1 >> t2
+    print("Running DAG...")
+    dag.run()
+
+
+if __name__ == "__main__":
+    main()
+"""
+        print(template)
