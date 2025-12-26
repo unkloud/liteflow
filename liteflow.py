@@ -87,6 +87,35 @@ class DagRun:
             ).fetchall()
             return {row["task_id"]: row["status"] for row in rows}
 
+    def maintain_task_instance(
+        self,
+        db_path: str,
+        task_id: str,
+        dependencies: List[str],
+        timeout: int,
+        try_number: int = 1,
+    ) -> "TaskInstance":
+        """Prepares a task instance for execution, updating DB if it's a retry."""
+        now = int(time.time())
+        if try_number > 1:
+            with closing(connect(db_path)) as conn:
+                with conn:
+                    conn.execute(
+                        "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                        (
+                            self.run_id,
+                            task_id,
+                            Status.PENDING,
+                            json.dumps(dependencies),
+                            timeout,
+                            try_number,
+                            now,
+                        ),
+                    )
+        return TaskInstance(
+            self.run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
+        )
+
 
 @dataclass
 class TaskInstance:
@@ -117,36 +146,6 @@ class TaskInstance:
         ) STRICT;
         CREATE INDEX IF NOT EXISTS idx_liteflow_task_instances_status ON liteflow_task_instances (status); \
         """
-
-    @classmethod
-    def create(
-        cls,
-        db_path: str,
-        run_id: str,
-        task_id: str,
-        dependencies: List[str],
-        timeout: int,
-        try_number: int = 1,
-    ):
-        """Creates a task instance record."""
-        now = int(time.time())
-        with closing(connect(db_path)) as conn:
-            with conn:
-                conn.execute(
-                    "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (
-                        run_id,
-                        task_id,
-                        Status.PENDING,
-                        json.dumps(dependencies),
-                        timeout,
-                        try_number,
-                        now,
-                    ),
-                )
-        return cls(
-            run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
-        )
 
     def update_status(self, db_path: str, status: str, error_log: str = None):
         """Updates the status of this task instance."""
@@ -501,9 +500,8 @@ class Dag:
 
                     kwargs = self._resolve_task_kwargs(task, dag_run.run_id)
                     start_times[task_id] = time.time()
-                    ti = TaskInstance.create(
+                    ti = dag_run.maintain_task_instance(
                         self.db_path,
-                        dag_run.run_id,
                         task_id,
                         list(task.dependencies),
                         task.timeout,
