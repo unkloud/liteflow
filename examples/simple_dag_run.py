@@ -24,7 +24,7 @@ def load_data(transform_data: int) -> str:
     return "Data loaded successfully."
 
 
-def main() -> None:
+def main():
     """Drive the simple DAG execution."""
     # The db_path will be created automatically if it doesn't exist
     init_schema("example_flow.db")

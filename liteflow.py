@@ -64,19 +64,6 @@ class DagRun:
         ) STRICT; \
         """
 
-    @classmethod
-    def create(cls, db_path: str, dag_id: str) -> "DagRun":
-        """Creates a new DAG run entry."""
-        run_id = generate_uuid()
-        now = int(time.time())
-        with closing(connect(db_path)) as conn:
-            with conn:
-                conn.execute(
-                    "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)",
-                    (run_id, dag_id, Status.PENDING, now),
-                )
-        return cls(run_id=run_id, dag_id=dag_id, status=Status.PENDING, created_at=now)
-
     def update_status(self, db_path: str, status: str):
         """Updates the status of this run."""
         logger.info(f"Updating run {self.run_id} status to {status}")
@@ -406,9 +393,22 @@ class Dag:
         self.tasks[task.task_id] = task
         return task
 
-    def create_run(self) -> DagRun:
+    def new_dag_run(self) -> DagRun:
+        """Creates a new DAG run entry in the database."""
+        run_id = generate_uuid()
+        now = int(time.time())
+        with closing(connect(self.db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)",
+                    (run_id, self.dag_id, Status.PENDING, now),
+                )
+        return DagRun(
+            run_id=run_id, dag_id=self.dag_id, status=Status.PENDING, created_at=now
+        )
+
+    def _initialize_task_instances(self, dag_run: DagRun):
         """Creates a new DAG run and initializes task instances."""
-        dag_run = DagRun.create(self.db_path, self.dag_id)
         for task_id, task in self.tasks.items():
             TaskInstance.create(
                 self.db_path,
@@ -440,7 +440,8 @@ class Dag:
 
     def run(self) -> DagRun:
         """Executes the DAG using ProcessPoolExecutor."""
-        dag_run = self.create_run()
+        dag_run = self.new_dag_run()
+        self._initialize_task_instances(dag_run)
         logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
         # Build the graph for execution
         graph = {t_id: task.dependencies for t_id, task in self.tasks.items()}
