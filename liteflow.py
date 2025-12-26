@@ -14,7 +14,12 @@ import traceback
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Self
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Type
+
+try:
+    from typing import Self
+except ImportError:
+    Self = Any  # Fallback for Python < 3.11
 
 SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
 SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
