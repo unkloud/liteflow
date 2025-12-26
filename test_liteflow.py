@@ -434,3 +434,24 @@ class TestLiteFlow(unittest.TestCase):
             t1 >> t2
 
             self.assertIn("step1", t2.dependencies)
+
+    def test_task_instance_integrity(self):
+        """Verify that DB task instances match the DAG definition exactly."""
+        with Dag("integrity_dag", db_path=self.db_path) as dag:
+            dag.task(noop, task_id="t1")
+            dag.task(noop, task_id="t2")
+            dag.task(noop, task_id="t3")
+
+        run = dag.run()
+
+        # Fetch all task instances for this run
+        with sqlite3.connect(self.db_path) as conn:
+            rows = conn.execute(
+                "SELECT task_id FROM liteflow_task_instances WHERE run_id = ?",
+                (run.run_id,),
+            ).fetchall()
+
+        task_ids_in_db = {row[0] for row in rows}
+        expected_task_ids = {"t1", "t2", "t3"}
+
+        self.assertEqual(task_ids_in_db, expected_task_ids)

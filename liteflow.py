@@ -36,6 +36,12 @@ logger = logging.getLogger("LiteFlow")
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
 
 
+class DeadlockError(Exception):
+    """Custom exception for detecting deadlocks in DAG execution."""
+
+    pass
+
+
 # --- SQL Statements ---
 
 
@@ -170,6 +176,10 @@ class TaskInstance:
         if error_log:
             self.error_log = error_log
 
+    def xcom_push(self, db_path: str, key: str, value: Any):
+        """Stores an XCom value for this task instance."""
+        XCom.save(db_path, self.run_id, self.task_id, key, value)
+
 
 @dataclass
 class XComFileRef:
@@ -238,7 +248,7 @@ class XCom:
             return None
 
 
-def generate_uuid() -> str:
+def new_uuid() -> str:
     return str(uuid.uuid4())
 
 
@@ -285,7 +295,7 @@ class Task:
         try:
             # Execute the actual user function
             result = self.func(**kwargs)
-            XCom.save(db_path, ti.run_id, ti.task_id, "return_value", result)
+            ti.xcom_push(db_path, "return_value", result)
             ti.update_status(db_path, Status.SUCCESS)
             logger.info(f"Worker finished task {ti.task_id} successfully")
             return None
@@ -294,6 +304,22 @@ class Task:
             logger.error(f"Worker failed task {ti.task_id}: {err}")
             ti.update_status(db_path, Status.FAILED, error_log=err)
             return err
+
+    def resolve_kwargs(self, db_path: str, run_id: str) -> Dict[str, Any]:
+        """Resolves task arguments by fetching XCom values from dependencies."""
+        sig = inspect.signature(self.func)
+        kwargs = self.bound_args.copy()
+        for param_name in sig.parameters:
+            upstream_task_id = self.arg_dependencies.get(param_name)
+            if not upstream_task_id and param_name in self.dependencies:
+                upstream_task_id = param_name
+            if upstream_task_id:
+                logger.debug(
+                    f"Resolving dependency arg '{param_name}' for task {self.task_id} from {upstream_task_id}"
+                )
+                val = XCom.load(db_path, run_id, upstream_task_id, "return_value")
+                kwargs[param_name] = val
+        return kwargs
 
     def __rshift__(self, other: Union["Task", List["Task"]]):
         """Allows use of >> operator to set dependencies."""
@@ -410,7 +436,7 @@ class Dag:
 
     def new_dag_run(self) -> DagRun:
         """Creates a new DAG run and initializes task instances in a single transaction."""
-        run_id = generate_uuid()
+        run_id = new_uuid()
         now = int(time.time())
         with closing(connect(self.db_path)) as conn:
             with conn:
@@ -436,23 +462,6 @@ class Dag:
         return DagRun(
             run_id=run_id, dag_id=self.dag_id, status=Status.PENDING, created_at=now
         )
-
-    def _resolve_task_kwargs(self, task: Task, run_id: str) -> Dict[str, Any]:
-        """Resolves task arguments by fetching XCom values from dependencies."""
-        sig = inspect.signature(task.func)
-        kwargs = task.bound_args.copy()
-        for param_name in sig.parameters:
-            upstream_task_id = task.arg_dependencies.get(param_name)
-            if not upstream_task_id and param_name in task.dependencies:
-                upstream_task_id = param_name
-
-            if upstream_task_id:
-                logger.debug(
-                    f"Resolving dependency arg '{param_name}' for task {task.task_id} from {upstream_task_id}"
-                )
-                val = XCom.load(self.db_path, run_id, upstream_task_id, "return_value")
-                kwargs[param_name] = val
-        return kwargs
 
     def run(self) -> DagRun:
         """Executes the DAG using ProcessPoolExecutor."""
@@ -497,8 +506,7 @@ class Dag:
                     task = self.tasks[task_id]
                     current_try = task_retry_counts.get(task_id, 0) + 1
                     task_retry_counts[task_id] = current_try
-
-                    kwargs = self._resolve_task_kwargs(task, dag_run.run_id)
+                    kwargs = task.resolve_kwargs(self.db_path, dag_run.run_id)
                     start_times[task_id] = time.time()
                     ti = dag_run.maintain_task_instance(
                         self.db_path,
@@ -517,7 +525,7 @@ class Dag:
 
                 if not futures and not waiting_for_retry:
                     if ts.is_active():
-                        raise RuntimeError(
+                        raise DeadlockError(
                             f"Deadlock detected in DAG {self.dag_id}: Tasks are pending but none are ready or running."
                         )
                     break
