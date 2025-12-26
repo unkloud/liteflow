@@ -468,10 +468,6 @@ class Dag:
         dag_run = self.new_dag_run()
         logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
 
-        # Get current state of tasks
-        task_states = dag_run.get_all_task_states(self.db_path)
-        # Mark run as RUNNING
-        dag_run.update_status(self.db_path, Status.RUNNING)
         futures = {}
         start_times = {}
         waiting_for_retry = {}  # task_id -> wake_up_timestamp
@@ -479,6 +475,8 @@ class Dag:
 
         executor = concurrent.futures.ProcessPoolExecutor()
         try:
+            # Mark run as RUNNING
+            dag_run.update_status(self.db_path, Status.RUNNING)
             while ts.is_active() or futures or waiting_for_retry:
                 # 1. Check for retries ready to run
                 now = time.time()
@@ -493,12 +491,6 @@ class Dag:
 
                 # 3. Schedule tasks
                 for task_id in list(new_ready_tasks) + ready_retries:
-                    current_status = task_states.get(task_id, Status.PENDING)
-
-                    if current_status == Status.SUCCESS:
-                        logger.info(f"Task {task_id} already SUCCESS, skipping.")
-                        ts.done(task_id)
-                        continue
                     # Execute task
                     logger.info(f"Scheduling task {task_id}")
                     task = self.tasks[task_id]
