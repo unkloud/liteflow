@@ -455,8 +455,6 @@ class Dag:
 
     def run(self) -> DagRun:
         """Executes the DAG using ProcessPoolExecutor."""
-        dag_run = self.new_dag_run()
-        logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
         # Build the graph for execution
         graph = {t_id: task.dependencies for t_id, task in self.tasks.items()}
         logger.info(f"Graph for DAG {self.dag_id}: {graph}")
@@ -465,8 +463,11 @@ class Dag:
             ts.prepare()
         except graphlib.CycleError as e:
             logger.error(f"Cycle detected in DAG {self.dag_id}: {e}")
-            dag_run.update_status(self.db_path, Status.FAILED)
-            return dag_run
+            raise
+
+        dag_run = self.new_dag_run()
+        logger.info(f"Starting DAG run {dag_run.run_id} for DAG {self.dag_id}")
+
         # Get current state of tasks
         task_states = dag_run.get_all_task_states(self.db_path)
         # Mark run as RUNNING

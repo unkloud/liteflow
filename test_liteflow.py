@@ -1,3 +1,4 @@
+import graphlib
 import os
 import pickle
 import random
@@ -231,8 +232,8 @@ class TestLiteFlow(unittest.TestCase):
             t1 >> t2
             t2 >> t1
 
-        run = dag.run()
-        self._assert_run_status(run.run_id, "FAILED")
+        with self.assertRaises(graphlib.CycleError):
+            dag.run()
 
     def test_diamond_dependency(self):
         with Dag("diamond_dag", db_path=self.db_path) as dag:
@@ -368,7 +369,7 @@ class TestLiteFlow(unittest.TestCase):
 
         run = dag.run()
         self._assert_run_status(run.run_id, "FAILED")
-        
+
         # Should have tried 2 times
         row = self._query(
             "SELECT try_number FROM liteflow_task_instances WHERE run_id=? AND task_id='slow'",
