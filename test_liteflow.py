@@ -24,12 +24,6 @@ def fail_once():
         raise Exception("Fail once")
 
 
-def fail_twice():
-    # Fails if flag exists (starts at 2), decrements flag
-    # This simulates needing 2 retries (3 attempts total)
-    pass # Logic implemented in test setup via file flags is tricky for counters.
-
-
 def producer():
     return {"val": 42}
 
@@ -114,7 +108,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("success_dag", db_path=self.db_path) as dag:
             t1 = dag.task(noop, task_id="t1")
             t2 = dag.task(noop, task_id="t2")
-            _ = t1 >> t2
+            t1 >> t2
 
         run = dag.run()
         self._assert_run_status(run.run_id, "SUCCESS")
@@ -125,20 +119,33 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("fail_dag", db_path=self.db_path) as dag:
             t1 = dag.task(fail, task_id="t1")
             t2 = dag.task(noop, task_id="t2")
-            _ = t1 >> t2
+            t1 >> t2
 
         run = dag.run()
         self._assert_run_status(run.run_id, "FAILED")
         self._assert_task_status(run.run_id, "t1", "FAILED")
         self._assert_task_status(run.run_id, "t2", "PENDING")
 
-    def test_persist_then_execute(self):
-        dag_id = "resume_dag"
+    def test_lifecycle_construct_persist_load_execute(self):
+        """Test the full lifecycle: Define -> Persist -> Load -> Re-attach -> Execute."""
+        dag_id = "lifecycle_dag"
+
+        # 1. Define and Persist
+        # The context manager automatically persists the DAG structure to the DB upon exit.
         with Dag(dag_id, db_path=self.db_path) as dag:
             t1 = dag.task(noop, task_id="t1")
             t2 = dag.task(noop, task_id="t2")
-            _ = t1 >> t1
+            t1 >> t2
+
+        # 2. Load Metadata
         dag = Dag.load(db_path=self.db_path, dag_id=dag_id)
+
+        # 3. Re-attach Logic (Bind functions to task IDs)
+        # Since the DB only stores metadata, we must re-bind the Python callables.
+        dag.task(noop, task_id="t1")
+        dag.task(noop, task_id="t2")
+
+        # 4. Execute
         run = dag.run()
         self._assert_run_status(run.run_id, "SUCCESS")
 
@@ -150,7 +157,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("resume_dag", db_path=self.db_path) as dag:
             t1 = dag.task(noop, task_id="t1")
             t2 = dag.task(fail_once, task_id="t2")
-            _ = t1 >> t2
+            t1 >> t2
 
         # Run 1: Fails at t2
         run1 = dag.run()
@@ -166,7 +173,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("xcom_dag", db_path=self.db_path) as dag:
             t1 = dag.task(producer, task_id="producer")
             t2 = dag.task(consumer, task_id="consumer")
-            _ = t1 >> t2
+            t1 >> t2
 
         dag_run = dag.run()
 
@@ -210,7 +217,7 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("large_xcom_dag", db_path=self.db_path) as dag:
             t1 = dag.task(large_producer, task_id="producer")
             t2 = dag.task(large_consumer, task_id="consumer")
-            _ = t1 >> t2
+            t1 >> t2
 
         run_id = dag.run().run_id
         result = XCom.load(self.db_path, run_id, "consumer", "return_value")
@@ -221,8 +228,8 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("cycle_dag", db_path=self.db_path) as dag:
             t1 = dag.task(noop, task_id="t1")
             t2 = dag.task(noop, task_id="t2")
-            _ = t1 >> t2
-            _ = t2 >> t1
+            t1 >> t2
+            t2 >> t1
 
         run = dag.run()
         self._assert_run_status(run.run_id, "FAILED")
@@ -233,9 +240,9 @@ class TestLiteFlow(unittest.TestCase):
             tb = dag.task(noop, task_id="B")
             tc = dag.task(noop, task_id="C")
             td = dag.task(noop, task_id="D")
-            _ = ta >> [tb, tc]
-            _ = tb >> td
-            _ = tc >> td
+            ta >> [tb, tc]
+            tb >> td
+            tc >> td
 
         run = dag.run()
         self._assert_run_status(run.run_id, "SUCCESS")
@@ -269,8 +276,8 @@ class TestLiteFlow(unittest.TestCase):
             ]
             for i in range(19):
                 for j in range(100):
-                    _ = layers[i][j] >> layers[i + 1][j]
-                    _ = layers[i][(j + 1) % 100] >> layers[i + 1][j]
+                    layers[i][j] >> layers[i + 1][j]
+                    layers[i][(j + 1) % 100] >> layers[i + 1][j]
 
         run = dag.run()
         self._assert_run_status(run.run_id, "SUCCESS")
@@ -381,6 +388,6 @@ class TestLiteFlow(unittest.TestCase):
         with Dag("mix_dag", db_path=self.db_path) as dag:
             t1 = dag.task(step1)
             t2 = dag.task(step2)
-            _ = t1 >> t2
+            t1 >> t2
 
             self.assertIn("step1", t2.dependencies)
