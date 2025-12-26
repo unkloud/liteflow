@@ -12,7 +12,7 @@ import traceback
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Self
 
 SQL_PRAGMA_WAL = "PRAGMA journal_mode=WAL;"
 SQL_PRAGMA_SYNCHRONOUS = "PRAGMA synchronous=NORMAL;"
@@ -543,3 +543,21 @@ class Dag:
         dag_run.update_status(self.db_path, Status.SUCCESS)
         logger.info(f"DAG run {dag_run.run_id} completed successfully.")
         return dag_run
+
+    @classmethod
+    def load(cls, db_path: str, dag_id: str) -> Self:
+        """Loads a DAG from the database."""
+        with closing(connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT dag_id, description FROM liteflow_dags WHERE dag_id = ?",
+                (dag_id,),
+            ).fetchone()
+            if row:
+                # Note: This only loads the DAG metadata. Tasks are not stored in the DB
+                # as they are defined in code. The DAG object is primarily for orchestrating runs.
+                return cls(
+                    dag_id=row["dag_id"],
+                    db_path=db_path,
+                    description=row["description"],
+                )
+            raise ValueError(f"DAG with ID '{dag_id}' not found in database.")

@@ -126,6 +126,16 @@ class TestLiteFlow(unittest.TestCase):
         self._assert_task_status(run.run_id, "t1", "FAILED")
         self._assert_task_status(run.run_id, "t2", "PENDING")
 
+    def test_persist_then_execute(self):
+        dag_id = "resume_dag"
+        with Dag(dag_id, db_path=self.db_path) as dag:
+            t1 = dag.task(noop, task_id="t1")
+            t2 = dag.task(noop, task_id="t2")
+            _ = t1 >> t1
+        dag = Dag.load(db_path=self.db_path, dag_id=dag_id)
+        run = dag.run()
+        self._assert_run_status(run.run_id, "SUCCESS")
+
     def test_resumption(self):
         # Create flag for first run failure
         with open("fail.flag", "w") as f:
