@@ -122,6 +122,28 @@ class DagRun:
             self.run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
         )
 
+    def get_task_instance(self, db_path: str, task_id: str) -> Optional["TaskInstance"]:
+        """Retrieves a task instance from the database."""
+        with closing(connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT status, dependencies, timeout, try_number, updated_at, error_log FROM liteflow_task_instances WHERE run_id = ? AND task_id = ?",
+                (self.run_id, task_id),
+            ).fetchone()
+            if row:
+                return TaskInstance(
+                    run_id=self.run_id,
+                    task_id=task_id,
+                    status=row["status"],
+                    dependencies=(
+                        json.loads(row["dependencies"]) if row["dependencies"] else []
+                    ),
+                    timeout=row["timeout"],
+                    try_number=row["try_number"],
+                    updated_at=row["updated_at"],
+                    error_log=row["error_log"],
+                )
+        return None
+
 
 @dataclass
 class TaskInstance:
@@ -179,6 +201,33 @@ class TaskInstance:
     def xcom_push(self, db_path: str, key: str, value: Any):
         """Stores an XCom value for this task instance."""
         XCom.save(db_path, self.run_id, self.task_id, key, value)
+
+    def xcom_pull(self, db_path: str, key: str) -> Any:
+        """Retrieves an XCom value from a specific task in the same run."""
+        return XCom.load(db_path, self.run_id, self.task_id, key)
+
+    @classmethod
+    def load(cls, db_path: str, run_id: str, task_id: str) -> Optional[Self]:
+        """Retrieves a task instance from the database."""
+        with closing(connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT status, dependencies, timeout, try_number, updated_at, error_log FROM liteflow_task_instances WHERE run_id = ? AND task_id = ?",
+                (run_id, task_id),
+            ).fetchone()
+            if row:
+                return cls(
+                    run_id=run_id,
+                    task_id=task_id,
+                    status=row["status"],
+                    dependencies=(
+                        json.loads(row["dependencies"]) if row["dependencies"] else []
+                    ),
+                    timeout=row["timeout"],
+                    try_number=row["try_number"],
+                    updated_at=row["updated_at"],
+                    error_log=row["error_log"],
+                )
+        return None
 
 
 @dataclass
@@ -305,7 +354,7 @@ class Task:
             ti.update_status(db_path, Status.FAILED, error_log=err)
             return err
 
-    def resolve_kwargs(self, db_path: str, run_id: str) -> Dict[str, Any]:
+    def resolve_kwargs(self, db_path: str, ti: TaskInstance) -> Dict[str, Any]:
         """Resolves task arguments by fetching XCom values from dependencies."""
         sig = inspect.signature(self.func)
         kwargs = self.bound_args.copy()
@@ -317,7 +366,8 @@ class Task:
                 logger.debug(
                     f"Resolving dependency arg '{param_name}' for task {self.task_id} from {upstream_task_id}"
                 )
-                val = XCom.load(db_path, run_id, upstream_task_id, "return_value")
+                upstream_ti = TaskInstance.load(db_path, ti.run_id, upstream_task_id)
+                val = upstream_ti.xcom_pull(db_path, "return_value")
                 kwargs[param_name] = val
         return kwargs
 
@@ -506,8 +556,6 @@ class Dag:
                     task = self.tasks[task_id]
                     current_try = task_retry_counts.get(task_id, 0) + 1
                     task_retry_counts[task_id] = current_try
-                    kwargs = task.resolve_kwargs(self.db_path, dag_run.run_id)
-                    start_times[task_id] = time.time()
                     ti = dag_run.maintain_task_instance(
                         self.db_path,
                         task_id,
@@ -515,6 +563,8 @@ class Dag:
                         task.timeout,
                         try_number=current_try,
                     )
+                    kwargs = task.resolve_kwargs(self.db_path, ti)
+                    start_times[task_id] = time.time()
                     future = executor.submit(
                         task.execute_worker,
                         self.db_path,
@@ -556,15 +606,8 @@ class Dag:
                                 logger.warning(
                                     f"Task {task_id} failed. Retrying in {task.retry_delay}s (Attempt {current_try}/{task.retries + 1})"
                                 )
-                                TaskInstance(
-                                    dag_run.run_id,
-                                    task_id,
-                                    Status.FAILED,
-                                    [],
-                                    0,
-                                    current_try,
-                                    0,
-                                ).update_status(
+                                ti = dag_run.get_task_instance(self.db_path, task_id)
+                                ti.update_status(
                                     self.db_path, Status.UP_FOR_RETRY, error_log=error
                                 )
                                 waiting_for_retry[task_id] = (
@@ -580,6 +623,12 @@ class Dag:
                             ts.done(task_id)
                     except Exception as e:
                         logger.error(f"Task {task_id} failed: {e}")
+                        # FIX: Update the specific task to FAILED so it doesn't stay RUNNING
+                        ti = dag_run.get_task_instance(self.db_path, task_id)
+                        if ti:
+                            ti.update_status(
+                                self.db_path, Status.FAILED, error_log=str(e)
+                            )
                         dag_run.update_status(self.db_path, Status.FAILED)
                         return dag_run
 
@@ -597,15 +646,7 @@ class Dag:
                         task = self.tasks[task_id]
                         current_try = task_retry_counts.get(task_id, 1)
 
-                        ti = TaskInstance(
-                            run_id=dag_run.run_id,
-                            task_id=task_id,
-                            status=Status.RUNNING,
-                            dependencies=list(self.tasks[task_id].dependencies),
-                            timeout=self.tasks[task_id].timeout,
-                            try_number=current_try,
-                            updated_at=int(now),
-                        )
+                        ti = dag_run.get_task_instance(self.db_path, task_id)
 
                         if current_try <= task.retries:
                             logger.warning(
