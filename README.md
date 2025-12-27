@@ -81,3 +81,17 @@ Execute the Python script directly. The DAG will initialize the SQLite database 
 ```bash
 python3 my_workflow.py
 ```
+
+### 3. Visualize the Run
+
+You can visualize the execution status of a DAG run using the `visualize` command. This generates a Mermaid diagram
+showing task dependencies and their status.
+Using `examples/complex_workflow.py` as an example:
+
+1. Run the workflow:
+2. Visualize the latest run:
+
+```bash
+   # Visualize the latest run for DAG ID 'complex_workflow'
+   python3 -m liteflow visualize layered_dag_171 --db liteflow.db
+```     
