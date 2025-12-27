@@ -590,7 +590,7 @@ class Dag:
             run_id=run_id, dag_id=self.dag_id, status=Status.PENDING, created_at=now
         )
 
-    def run(self) -> DagRun:
+    def run(self, max_workers: int = None) -> DagRun:
         """Executes the DAG using ProcessPoolExecutor."""
         # Build the graph for execution
         graph = {t_id: task.dependencies for t_id, task in self.tasks.items()}
@@ -610,7 +610,7 @@ class Dag:
         waiting_for_retry = {}  # task_id -> wake_up_timestamp
         task_retry_counts = {}  # task_id -> current_try_number
 
-        executor = concurrent.futures.ProcessPoolExecutor()
+        executor = concurrent.futures.ProcessPoolExecutor(max_workers=max_workers)
         try:
             # Mark run as RUNNING
             dag_run.update_status(self.db_path, Status.RUNNING)
