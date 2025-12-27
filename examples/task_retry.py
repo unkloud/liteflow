@@ -4,7 +4,6 @@ from pathlib import Path
 
 # Add project root to path to import liteflow
 sys.path.insert(0, str(Path(__file__).parents[1]))
-
 from liteflow import Dag, init_schema
 
 DB_PATH = "examples.db"

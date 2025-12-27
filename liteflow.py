@@ -170,7 +170,13 @@ class DagRun:
                     )
                 )
             instances[task_id] = TaskInstance(
-                self.run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
+                self.run_id,
+                task_id,
+                Status.PENDING,
+                dependencies,
+                timeout,
+                try_number,
+                now,
             )
 
         if retries_params:
@@ -859,49 +865,44 @@ def visualize(db_path: str, dag_id_or_run_id: str):
     import webbrowser
 
     run_id = dag_id_or_run_id
-    temp_run = None
-
     # Try to load as DAG to see if it exists
     try:
         dag = Dag.load(db_path, dag_id_or_run_id)
-        print(f"Generating temporary run for DAG '{dag_id_or_run_id}'...")
-        temp_run = dag.new_dag_run()
-        run_id = temp_run.run_id
+        # DAG exists, find the latest run to visualize structure
+        with closing(connect(db_path)) as conn:
+            row = conn.execute(
+                "SELECT run_id FROM liteflow_dag_runs WHERE dag_id = ? ORDER BY created_at DESC LIMIT 1",
+                (dag.dag_id,),
+            ).fetchone()
+        if row:
+            run_id = row["run_id"]
+            print(f"Visualizing latest run '{run_id}' for DAG '{dag.dag_id}'...")
+        else:
+            print(
+                f"DAG '{dag.dag_id}' has no runs. Cannot visualize structure without task definitions.",
+                file=sys.stderr,
+            )
+            return
     except ValueError:
         # Not a DAG ID, assume it is a Run ID
         pass
-
     with closing(connect(db_path)) as conn:
+        mermaid_lines = [
+            "graph TD",
+            "  %% Styles",
+            "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;",
+            "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;",
+            "  classDef RUNNING fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;",
+            "  classDef PENDING fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41;",
+            "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;",
+            "  %% Nodes & Edges",
+        ]
         rows = conn.execute(
             "SELECT task_id, status, dependencies FROM liteflow_task_instances WHERE run_id = ?",
             (run_id,),
         ).fetchall()
-        mermaid_lines = []
-        mermaid_lines.append("graph TD")
-        mermaid_lines.append("  %% Styles")
-        mermaid_lines.append(
-            "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;"
-        )
-        mermaid_lines.append(
-            "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;"
-        )
-        mermaid_lines.append(
-            "  classDef RUNNING fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;"
-        )
-        mermaid_lines.append(
-            "  classDef PENDING fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41;"
-        )
-        mermaid_lines.append(
-            "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;"
-        )
-        mermaid_lines.append("  %% Nodes & Edges")
         if not rows:
             print(f"Warning: No tasks found for run_id: {run_id}", file=sys.stderr)
-            if temp_run:
-                print(
-                    "Note: DAGs loaded from CLI do not have tasks attached. Run this from your Python script to visualize tasks.",
-                    file=sys.stderr,
-                )
         for row in rows:
             t_id = row["task_id"]
             status = row["status"]
@@ -929,16 +930,16 @@ def visualize(db_path: str, dag_id_or_run_id: str):
     </div>
 </body>
 </html>"""
-
-        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w") as tmp:
+        with tempfile.NamedTemporaryFile(
+            delete=False,
+            prefix=f"liteflow_{dag_id_or_run_id}_",
+            suffix=".html",
+            mode="w",
+        ) as tmp:
             tmp.write(html_content)
             url = "file://" + os.path.abspath(tmp.name)
             print(f"Opening visualization in browser: {url}")
             webbrowser.open(url)
-
-    if temp_run:
-        temp_run.delete(db_path)
-        print(f"Deleted temporary run {temp_run.run_id}.")
 
 
 if __name__ == "__main__":
