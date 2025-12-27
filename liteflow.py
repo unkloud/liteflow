@@ -141,34 +141,46 @@ class DagRun:
             ).fetchall()
             return {row["task_id"]: row["status"] for row in rows}
 
-    def maintain_task_instance(
+    def maintain_task_instances(
         self,
         db_path: str,
-        task_id: str,
-        dependencies: List[str],
-        timeout: int,
-        try_number: int = 1,
-    ) -> "TaskInstance":
-        """Prepares a task instance for execution, updating DB if it's a retry."""
+        tasks_data: List[Dict[str, Any]],
+    ) -> Dict[str, "TaskInstance"]:
+        """Prepares multiple task instances for execution, updating DB if they are retries."""
         now = int(time.time())
-        if try_number > 1:
+        retries_params = []
+        instances = {}
+
+        for data in tasks_data:
+            task_id = data["task_id"]
+            dependencies = data["dependencies"]
+            timeout = data["timeout"]
+            try_number = data["try_number"]
+
+            if try_number > 1:
+                retries_params.append(
+                    (
+                        self.run_id,
+                        task_id,
+                        Status.PENDING,
+                        json.dumps(dependencies),
+                        timeout,
+                        try_number,
+                        now,
+                    )
+                )
+            instances[task_id] = TaskInstance(
+                self.run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
+            )
+
+        if retries_params:
             with closing(connect(db_path)) as conn:
                 with conn:
-                    conn.execute(
+                    conn.executemany(
                         "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            self.run_id,
-                            task_id,
-                            Status.PENDING,
-                            json.dumps(dependencies),
-                            timeout,
-                            try_number,
-                            now,
-                        ),
+                        retries_params,
                     )
-        return TaskInstance(
-            self.run_id, task_id, Status.PENDING, dependencies, timeout, try_number, now
-        )
+        return instances
 
     def get_task_instance(self, db_path: str, task_id: str) -> Optional["TaskInstance"]:
         """Retrieves a task instance from the database."""
@@ -571,20 +583,22 @@ class Dag:
                     "INSERT INTO liteflow_dag_runs (run_id, dag_id, status, created_at) VALUES (?, ?, ?, ?)",
                     (run_id, self.dag_id, Status.PENDING, now),
                 )
-                for task_id, task in self.tasks.items():
-                    conn.execute(
-                        "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                        (
-                            run_id,
-                            task_id,
-                            Status.PENDING,
-                            json.dumps(list(task.dependencies)),
-                            task.timeout,
-                            1,
-                            now,
-                        ),
+                task_params = [
+                    (
+                        run_id,
+                        task_id,
+                        Status.PENDING,
+                        json.dumps(list(task.dependencies)),
+                        task.timeout,
+                        1,
+                        now,
                     )
-
+                    for task_id, task in self.tasks.items()
+                ]
+                conn.executemany(
+                    "INSERT OR REPLACE INTO liteflow_task_instances (run_id, task_id, status, dependencies, timeout, try_number, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    task_params,
+                )
         logger.info(f"Initialized DAG run {run_id} for DAG {self.dag_id}")
         return DagRun(
             run_id=run_id, dag_id=self.dag_id, status=Status.PENDING, created_at=now
@@ -627,28 +641,37 @@ class Dag:
                 new_ready_tasks = ts.get_ready() if ts.is_active() else []
 
                 # 3. Schedule tasks
-                for task_id in list(new_ready_tasks) + ready_retries:
-                    # Execute task
-                    logger.info(f"Scheduling task {task_id}")
-                    task = self.tasks[task_id]
-                    current_try = task_retry_counts.get(task_id, 0) + 1
-                    task_retry_counts[task_id] = current_try
-                    ti = dag_run.maintain_task_instance(
-                        self.db_path,
-                        task_id,
-                        list(task.dependencies),
-                        task.timeout,
-                        try_number=current_try,
-                    )
-                    kwargs = task.resolve_kwargs(self.db_path, ti)
-                    start_times[task_id] = time.time()
-                    future = executor.submit(
-                        task.execute_worker,
-                        self.db_path,
-                        ti,
-                        kwargs,
-                    )
-                    futures[future] = task_id
+                tasks_to_schedule = list(new_ready_tasks) + ready_retries
+                if tasks_to_schedule:
+                    batch_data = []
+                    for task_id in tasks_to_schedule:
+                        task = self.tasks[task_id]
+                        current_try = task_retry_counts.get(task_id, 0) + 1
+                        task_retry_counts[task_id] = current_try
+                        batch_data.append(
+                            {
+                                "task_id": task_id,
+                                "dependencies": list(task.dependencies),
+                                "timeout": task.timeout,
+                                "try_number": current_try,
+                            }
+                        )
+
+                    tis_map = dag_run.maintain_task_instances(self.db_path, batch_data)
+
+                    for task_id in tasks_to_schedule:
+                        logger.info(f"Scheduling task {task_id}")
+                        task = self.tasks[task_id]
+                        ti = tis_map[task_id]
+                        kwargs = task.resolve_kwargs(self.db_path, ti)
+                        start_times[task_id] = time.time()
+                        future = executor.submit(
+                            task.execute_worker,
+                            self.db_path,
+                            ti,
+                            kwargs,
+                        )
+                        futures[future] = task_id
 
                 if not futures and not waiting_for_retry:
                     if ts.is_active():
@@ -853,7 +876,6 @@ def visualize(db_path: str, dag_id_or_run_id: str):
             "SELECT task_id, status, dependencies FROM liteflow_task_instances WHERE run_id = ?",
             (run_id,),
         ).fetchall()
-
         mermaid_lines = []
         mermaid_lines.append("graph TD")
         mermaid_lines.append("  %% Styles")
@@ -872,7 +894,6 @@ def visualize(db_path: str, dag_id_or_run_id: str):
         mermaid_lines.append(
             "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;"
         )
-
         mermaid_lines.append("  %% Nodes & Edges")
         if not rows:
             print(f"Warning: No tasks found for run_id: {run_id}", file=sys.stderr)
@@ -881,7 +902,6 @@ def visualize(db_path: str, dag_id_or_run_id: str):
                     "Note: DAGs loaded from CLI do not have tasks attached. Run this from your Python script to visualize tasks.",
                     file=sys.stderr,
                 )
-
         for row in rows:
             t_id = row["task_id"]
             status = row["status"]
@@ -889,23 +909,24 @@ def visualize(db_path: str, dag_id_or_run_id: str):
             mermaid_lines.append(f"  {t_id}[{t_id}]:::{status}")
             for dep in deps:
                 mermaid_lines.append(f"  {dep} --> {t_id}")
-
         mermaid_graph = "\n".join(mermaid_lines)
-
         html_content = f"""<!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>LiteFlow Visualization: {run_id}</title>
-</head>
-<body>
-    <pre class="mermaid">
-{mermaid_graph}
-    </pre>
+    <!-- Import Mermaid library from CDN -->
     <script type="module">
-        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs';
         mermaid.initialize({{ startOnLoad: true }});
     </script>
+    <meta charset="UTF-8">
+</head>
+<body>
+    <div class="mermaid">
+{mermaid_graph}
+    </div>
 </body>
 </html>"""
 
@@ -959,9 +980,7 @@ if __name__ == "__main__":
             sys.exit(1)
         Dag.delete_dag(args.db, args.dag_id)
         print(f"Deleted DAG '{args.dag_id}' and associated data.")
-
     elif args.command == "visualize":
         visualize(args.db, args.identifier)
-
     elif args.command == "scaffold":
         print(SCAFFOLD_TEMPLATE)
