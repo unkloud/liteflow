@@ -1,25 +1,5 @@
 #!/usr/bin/env python3
 
-"""
-LiteFlow: A lightweight, single-file DAG orchestration library using SQLite.
-
-LIMITATIONS:
-1. Code as Definition:
-   The database stores execution state (history, logs, XComs) and DAG metadata, but it does NOT
-   store the task code or graph structure. The Python script is the source of truth for the DAG
-   definition.
-
-2. Dag.load() Behavior:
-   Because code is not stored in the DB, `Dag.load()` retrieves only metadata (ID, description).
-   It returns a `Dag` object that is useful for inspection or history queries, but it cannot be
-   used to `run()` the workflow because it lacks the task definitions. To execute a DAG, you must
-   run the Python script where the tasks are defined.
-
-3. Single Node Execution:
-   This library uses `ProcessPoolExecutor` for parallelism, meaning it is restricted to a single
-   machine.
-"""
-
 import concurrent.futures
 import graphlib
 import inspect
@@ -34,7 +14,7 @@ import traceback
 import uuid
 from contextlib import closing
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar, Type
+from typing import Dict, List, Optional, Any, Callable, Union, Set, ClassVar
 
 try:
     from typing import Self

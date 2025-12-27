@@ -44,6 +44,25 @@ Postgres, Redis, separate worker processes, web UIs).
 - **Not for Big Data Scale:** While it handles heavy tasks, the orchestration throughput is limited by SQLite and the
   single machine's resources.
 
+## Design Constraints
+
+1. **Code as Definition**
+   The database stores execution state (history, logs, XComs) and DAG metadata, but it does NOT
+   store the task code or graph structure. The Python script is the source of truth for the DAG
+   definition.
+
+2. **Dag.load() Behavior**
+   Because code is not stored in the DB, `Dag.load()` retrieves only metadata (ID, description).
+   It returns a `Dag` object that is useful for inspection or history queries, but it cannot be
+   used to `run()` the workflow because it lacks the task definitions. To execute a DAG, you must
+   run the Python script where the tasks are defined.
+
+3. **Visualization Limitations**
+   The `visualize` command generates diagrams based on *historical execution data* (TaskInstances)
+   stored in the database. It cannot visualize a DAG structure purely from the DAG ID unless a
+   run has previously been initialized or executed. Consequently, visualization is an inspection
+   tool for deployed/executed workflows, not a development tool for designing new graphs.
+
 ## Getting Started
 
 ### 1. Scaffold a new DAG
