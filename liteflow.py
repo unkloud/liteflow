@@ -1,5 +1,25 @@
 #!/usr/bin/env python3
 
+"""
+LiteFlow: A lightweight, single-file DAG orchestration library using SQLite.
+
+LIMITATIONS:
+1. Code as Definition:
+   The database stores execution state (history, logs, XComs) and DAG metadata, but it does NOT
+   store the task code or graph structure. The Python script is the source of truth for the DAG
+   definition.
+
+2. Dag.load() Behavior:
+   Because code is not stored in the DB, `Dag.load()` retrieves only metadata (ID, description).
+   It returns a `Dag` object that is useful for inspection or history queries, but it cannot be
+   used to `run()` the workflow because it lacks the task definitions. To execute a DAG, you must
+   run the Python script where the tasks are defined.
+
+3. Single Node Execution:
+   This library uses `ProcessPoolExecutor` for parallelism, meaning it is restricted to a single
+   machine.
+"""
+
 import concurrent.futures
 import graphlib
 import inspect
@@ -148,6 +168,35 @@ class DagRun:
                     error_log=row["error_log"],
                 )
         return None
+
+    def delete(self, db_path: str):
+        """Deletes this DAG run and all associated tasks and XComs."""
+        logger.info(f"Deleting DAG run {self.run_id}")
+
+        # 1. Clean up XCom files on disk
+        xcom_dir = db_path + "_xcom"
+        if os.path.exists(xcom_dir):
+            for filename in os.listdir(xcom_dir):
+                # Filename format: {run_id}_{task_id}_{key}.bin
+                if filename.startswith(f"{self.run_id}_"):
+                    try:
+                        os.remove(os.path.join(xcom_dir, filename))
+                    except OSError as e:
+                        logger.warning(f"Failed to delete XCom file {filename}: {e}")
+
+        # 2. Database cleanup
+        with closing(connect(db_path)) as conn:
+            with conn:
+                conn.execute(
+                    "DELETE FROM liteflow_xcom WHERE run_id = ?", (self.run_id,)
+                )
+                conn.execute(
+                    "DELETE FROM liteflow_task_instances WHERE run_id = ?",
+                    (self.run_id,),
+                )
+                conn.execute(
+                    "DELETE FROM liteflow_dag_runs WHERE run_id = ?", (self.run_id,)
+                )
 
 
 @dataclass
@@ -750,6 +799,12 @@ if __name__ == "__main__":
     del_parser = subparsers.add_parser("delete", help="Delete a DAG")
     del_parser.add_argument("dag_id", help="ID of the DAG to delete")
     del_parser.add_argument("--db", required=True, help="Path to SQLite database")
+    # Visualize
+    viz_parser = subparsers.add_parser(
+        "visualize", help="Generate Mermaid diagram for a run"
+    )
+    viz_parser.add_argument("run_id", help="Run ID to visualize")
+    viz_parser.add_argument("--db", required=True, help="Path to SQLite database")
     # Scaffold
     scaffold_parser = subparsers.add_parser("scaffold", help="Generate a DAG template")
     args = parser.parse_args()
@@ -777,6 +832,48 @@ if __name__ == "__main__":
             sys.exit(1)
         Dag.delete_dag(args.db, args.dag_id)
         print(f"Deleted DAG '{args.dag_id}' and associated data.")
+
+    elif args.command == "visualize":
+        if not os.path.exists(args.db):
+            print(f"Database not found at {args.db}")
+            sys.exit(1)
+
+        with closing(connect(args.db)) as conn:
+            rows = conn.execute(
+                "SELECT task_id, status, dependencies FROM liteflow_task_instances WHERE run_id = ?",
+                (args.run_id,),
+            ).fetchall()
+
+            if not rows:
+                print(f"No tasks found for run_id: {args.run_id}", file=sys.stderr)
+                sys.exit(1)
+
+            print("graph TD")
+            print("  %% Styles")
+            print(
+                "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;"
+            )
+            print(
+                "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;"
+            )
+            print(
+                "  classDef RUNNING fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;"
+            )
+            print(
+                "  classDef PENDING fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41;"
+            )
+            print(
+                "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;"
+            )
+
+            print("  %% Nodes & Edges")
+            for row in rows:
+                t_id = row["task_id"]
+                status = row["status"]
+                deps = json.loads(row["dependencies"]) if row["dependencies"] else []
+                print(f"  {t_id}[{t_id}]:::{status}")
+                for dep in deps:
+                    print(f"  {dep} --> {t_id}")
 
     elif args.command == "scaffold":
         template = f"""import os

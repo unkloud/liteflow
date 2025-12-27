@@ -301,6 +301,57 @@ class TestLiteFlow(unittest.TestCase):
             self._query("SELECT 1 FROM liteflow_dag_runs WHERE dag_id=?", (dag2_id,))
         )
 
+    def test_delete_dag_run(self):
+        """Test removal of a specific DagRun and its artifacts."""
+        dag_id = "run_to_delete"
+
+        # Create and run DAG with large XCom to test file cleanup
+        with Dag(dag_id, db_path=self.db_path) as dag:
+            dag.task(large_producer, task_id="t1")
+
+        run = dag.run()
+        run_id = run.run_id
+
+        # Verify existence
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
+        )
+        self.assertIsNotNone(
+            self._query(
+                "SELECT 1 FROM liteflow_task_instances WHERE run_id=?", (run_id,)
+            )
+        )
+        self.assertIsNotNone(
+            self._query("SELECT 1 FROM liteflow_xcom WHERE run_id=?", (run_id,))
+        )
+
+        # Check for XCom file on disk
+        xcom_files = [f for f in os.listdir(self.xcom_dir) if f.startswith(run_id)]
+        self.assertTrue(len(xcom_files) > 0, "XCom file should exist on disk")
+
+        # Delete the run
+        run.delete(self.db_path)
+
+        # Verify deletion
+        self.assertIsNone(
+            self._query("SELECT 1 FROM liteflow_dag_runs WHERE run_id=?", (run_id,))
+        )
+        self.assertIsNone(
+            self._query(
+                "SELECT 1 FROM liteflow_task_instances WHERE run_id=?", (run_id,)
+            )
+        )
+        self.assertIsNone(
+            self._query("SELECT 1 FROM liteflow_xcom WHERE run_id=?", (run_id,))
+        )
+
+        # Check XCom file is gone
+        if os.path.exists(self.xcom_dir):
+            xcom_files_after = [
+                f for f in os.listdir(self.xcom_dir) if f.startswith(run_id)
+            ]
+            self.assertEqual(len(xcom_files_after), 0, "XCom file should be deleted")
+
     def test_parallel_execution(self):
         with Dag("parallel_dag", db_path=self.db_path) as dag:
             dag.task(sleep_1s, task_id="p1")
