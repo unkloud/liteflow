@@ -868,7 +868,7 @@ def visualize(db_path: str, dag_id_or_run_id: str):
         pass
     with closing(connect(db_path)) as conn:
         mermaid_lines = [
-            "graph TD",
+            "graph LR",
             "  %% Styles",
             "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;",
             "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;",

@@ -6,3 +6,4 @@ python simple_dag_run.py;
 python simple_dag_with_xcom.py;
 python persist_first_then_run.py;
 python task_retry.py;
+python complex_work_flow.py;
