@@ -59,15 +59,38 @@ logging.basicConfig(
 logger = logging.getLogger("LiteFlow")
 # --- Constants ---
 XCOM_FILE_THRESHOLD = 10 * 1024 * 1024  # 10MB
+SCAFFOLD_TEMPLATE = """import os
+import os
+from liteflow import Dag, init_schema
+
+
+def task_1():
+    print("Hello from Task 1")
+
+
+def main():
+    # Use DB path from env (CLI) or default
+    db_path = os.getenv("LITEFLOW_DB_PATH", "liteflow.db")
+    init_schema(db_path)
+
+    with Dag("my_new_dag", db_path=db_path, description="Auto-generated DAG") as dag:
+        t1 = dag.task(
+            task_1,
+            task_id="task1",
+        )
+        t2 = dag.task(task_1, task_id="task2")
+        _ = t1 >> t2
+    print("Running DAG...")
+    dag.run()
+
+
+if __name__ == "__main__":
+    main()
+"""
 
 
 class DeadlockError(Exception):
-    """Custom exception for detecting deadlocks in DAG execution."""
-
     pass
-
-
-# --- SQL Statements ---
 
 
 class Status:
@@ -786,6 +809,116 @@ class Dag:
                 )
             raise ValueError(f"DAG with ID '{dag_id}' not found in database.")
 
+    @classmethod
+    def all_dags(cls, db_path: str) -> List[Self]:
+        """Lists all DAGs in the database."""
+        with closing(connect(db_path)) as conn:
+            rows = conn.execute(
+                "SELECT dag_id, description FROM liteflow_dags ORDER BY dag_id"
+            ).fetchall()
+            return [
+                cls(
+                    dag_id=row["dag_id"],
+                    db_path=db_path,
+                    description=row["description"],
+                )
+                for row in rows
+            ]
+
+
+def visualize(db_path: str, dag_id_or_run_id: str):
+    """Generates a Mermaid diagram for a DAG or Run ID and opens it in the browser."""
+    if not os.path.exists(db_path):
+        print(f"Database not found at {db_path}")
+        sys.exit(1)
+
+    import tempfile
+    import webbrowser
+
+    run_id = dag_id_or_run_id
+    temp_run = None
+
+    # Try to load as DAG to see if it exists
+    try:
+        dag = Dag.load(db_path, dag_id_or_run_id)
+        print(f"Generating temporary run for DAG '{dag_id_or_run_id}'...")
+        temp_run = dag.new_dag_run()
+        run_id = temp_run.run_id
+    except ValueError:
+        # Not a DAG ID, assume it is a Run ID
+        pass
+
+    with closing(connect(db_path)) as conn:
+        rows = conn.execute(
+            "SELECT task_id, status, dependencies FROM liteflow_task_instances WHERE run_id = ?",
+            (run_id,),
+        ).fetchall()
+
+        mermaid_lines = []
+        mermaid_lines.append("graph TD")
+        mermaid_lines.append("  %% Styles")
+        mermaid_lines.append(
+            "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;"
+        )
+        mermaid_lines.append(
+            "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;"
+        )
+        mermaid_lines.append(
+            "  classDef RUNNING fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;"
+        )
+        mermaid_lines.append(
+            "  classDef PENDING fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41;"
+        )
+        mermaid_lines.append(
+            "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;"
+        )
+
+        mermaid_lines.append("  %% Nodes & Edges")
+        if not rows:
+            print(f"Warning: No tasks found for run_id: {run_id}", file=sys.stderr)
+            if temp_run:
+                print(
+                    "Note: DAGs loaded from CLI do not have tasks attached. Run this from your Python script to visualize tasks.",
+                    file=sys.stderr,
+                )
+
+        for row in rows:
+            t_id = row["task_id"]
+            status = row["status"]
+            deps = json.loads(row["dependencies"]) if row["dependencies"] else []
+            mermaid_lines.append(f"  {t_id}[{t_id}]:::{status}")
+            for dep in deps:
+                mermaid_lines.append(f"  {dep} --> {t_id}")
+
+        mermaid_graph = "\n".join(mermaid_lines)
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>LiteFlow Visualization: {run_id}</title>
+</head>
+<body>
+    <pre class="mermaid">
+{mermaid_graph}
+    </pre>
+    <script type="module">
+        import mermaid from 'https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.esm.min.mjs';
+        mermaid.initialize({{ startOnLoad: true }});
+    </script>
+</body>
+</html>"""
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".html", mode="w") as tmp:
+            tmp.write(html_content)
+            url = "file://" + os.path.abspath(tmp.name)
+            print(f"Opening visualization in browser: {url}")
+            webbrowser.open(url)
+
+    if temp_run:
+        temp_run.delete(db_path)
+        print(f"Deleted temporary run {temp_run.run_id}.")
+
 
 if __name__ == "__main__":
     import argparse
@@ -803,7 +936,7 @@ if __name__ == "__main__":
     viz_parser = subparsers.add_parser(
         "visualize", help="Generate Mermaid diagram for a run"
     )
-    viz_parser.add_argument("run_id", help="Run ID to visualize")
+    viz_parser.add_argument("identifier", help="DAG ID or Run ID to visualize")
     viz_parser.add_argument("--db", required=True, help="Path to SQLite database")
     # Scaffold
     scaffold_parser = subparsers.add_parser("scaffold", help="Generate a DAG template")
@@ -812,20 +945,14 @@ if __name__ == "__main__":
         if not os.path.exists(args.db):
             print(f"Database not found at {args.db}")
             sys.exit(1)
-        with closing(connect(args.db)) as conn:
-            rows = conn.execute(
-                "SELECT dag_id, description, created_at FROM liteflow_dags"
-            ).fetchall()
-            if not rows:
-                print("No DAGs found.")
-            else:
-                print(f"{'DAG ID':<30} | {'Created At':<20} | {'Description'}")
-                print("-" * 80)
-                for row in rows:
-                    created = time.strftime(
-                        "%Y-%m-%d %H:%M:%S", time.localtime(row["created_at"])
-                    )
-                    print(f"{row['dag_id']:<30} | {created:<20} | {row['description']}")
+        dags = Dag.all_dags(args.db)
+        if not dags:
+            print("No DAGs found.")
+        else:
+            print(f"{'DAG ID':<30} | {'Description'}")
+            print("-" * 80)
+            for dag in dags:
+                print(f"{dag.dag_id:<30} | {dag.description}")
     elif args.command == "delete":
         if not os.path.exists(args.db):
             print(f"Database not found at {args.db}")
@@ -834,74 +961,7 @@ if __name__ == "__main__":
         print(f"Deleted DAG '{args.dag_id}' and associated data.")
 
     elif args.command == "visualize":
-        if not os.path.exists(args.db):
-            print(f"Database not found at {args.db}")
-            sys.exit(1)
-
-        with closing(connect(args.db)) as conn:
-            rows = conn.execute(
-                "SELECT task_id, status, dependencies FROM liteflow_task_instances WHERE run_id = ?",
-                (args.run_id,),
-            ).fetchall()
-
-            if not rows:
-                print(f"No tasks found for run_id: {args.run_id}", file=sys.stderr)
-                sys.exit(1)
-
-            print("graph TD")
-            print("  %% Styles")
-            print(
-                "  classDef SUCCESS fill:#d4edda,stroke:#155724,stroke-width:2px,color:#155724;"
-            )
-            print(
-                "  classDef FAILED fill:#f8d7da,stroke:#721c24,stroke-width:2px,color:#721c24;"
-            )
-            print(
-                "  classDef RUNNING fill:#cce5ff,stroke:#004085,stroke-width:2px,color:#004085;"
-            )
-            print(
-                "  classDef PENDING fill:#e2e3e5,stroke:#383d41,stroke-width:2px,color:#383d41;"
-            )
-            print(
-                "  classDef UP_FOR_RETRY fill:#fff3cd,stroke:#856404,stroke-width:2px,color:#856404;"
-            )
-
-            print("  %% Nodes & Edges")
-            for row in rows:
-                t_id = row["task_id"]
-                status = row["status"]
-                deps = json.loads(row["dependencies"]) if row["dependencies"] else []
-                print(f"  {t_id}[{t_id}]:::{status}")
-                for dep in deps:
-                    print(f"  {dep} --> {t_id}")
+        visualize(args.db, args.identifier)
 
     elif args.command == "scaffold":
-        template = f"""import os
-import os
-from liteflow import Dag, init_schema
-
-
-def task_1():
-    print("Hello from Task 1")
-
-
-def main():
-    # Use DB path from env (CLI) or default
-    db_path = os.getenv("LITEFLOW_DB_PATH", "liteflow.db")
-    init_schema(db_path)
-
-    with Dag("my_new_dag", db_path=db_path, description="Auto-generated DAG") as dag:
-        t1 = dag.task(
-            task_1,
-            task_id="task1",
-        )
-        t2 = dag.task(task_1, task_id="task2")
-        _ = t1 >> t2
-    print("Running DAG...")
-    dag.run()
-
-
-if __name__ == "__main__":
-    main()
-"""
-        print(template)
+        print(SCAFFOLD_TEMPLATE)
